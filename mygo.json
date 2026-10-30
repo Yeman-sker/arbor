@@ -1,6 +1,10 @@
 {
-  "name": "arbor",
-  "identifier": "com.example.arbor",
+  "name": "Arbor",
+  "identifier": "io.github.yemansker.arbor",
   "version": "0.1.0",
-  "out": "build"
+  "out": "build",
+  "updates": {
+    "publicKey": "JcqwH2QsqKUptmLpoHosa5psrpCAzmpLukV42UN+UXk=",
+    "github": "Yeman-sker/arbor"
+  }
 }
