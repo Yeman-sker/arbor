@@ -1,8 +1,10 @@
 package main
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/egoist/mygo/ui"
@@ -42,14 +44,22 @@ func TestArborViewsWithTempGitRepo(t *testing.T) {
 	mustGit("config", "user.email", "test@arbor.dev")
 	mustGit("config", "user.name", "Arbor Tester")
 
+	subDir := filepath.Join(dir, "pkg")
+	if err := os.MkdirAll(subDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
 	fileA := filepath.Join(dir, "hello.go")
+	fileB := filepath.Join(subDir, "util.go")
 	if err := os.WriteFile(fileA, []byte("package main\n\nfunc main() {\n\tprintln(\"v1\")\n}\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	mustGit("add", "hello.go")
+	if err := os.WriteFile(fileB, []byte("package pkg\n\nfunc Helper() {}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	mustGit("add", ".")
 	mustGit("commit", "-m", "feat: initial commit")
 
-	// Modify hello.go in working tree so we have both a commit and a working tree diff
+	// Modify hello.go in working tree
 	if err := os.WriteFile(fileA, []byte("package main\n\nfunc main() {\n\tprintln(\"v2\")\n}\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -58,26 +68,68 @@ func TestArborViewsWithTempGitRepo(t *testing.T) {
 	if a.repo == nil {
 		t.Fatalf("expected repo loaded, got error: %s", a.repoErr)
 	}
-	if len(a.repo.Commits) != 1 {
-		t.Fatalf("expected 1 commit, got %d", len(a.repo.Commits))
-	}
-	if len(a.repo.Unstaged) != 1 {
-		t.Fatalf("expected 1 unstaged file, got %d", len(a.repo.Unstaged))
-	}
 
 	tt := ui.NewTester(a.view, 1280, 800)
-	if !tt.HasText("FILES") || !tt.HasText("hello.go") {
+	if !tt.HasText("Files") || !tt.HasText("hello.go") {
 		t.Fatalf("Explorer view missing expected texts: %v", tt.Texts())
 	}
 
-	// Switch to Git & Graph view via View Diff button
-	if err := tt.Click("View Diff →"); err != nil {
+	// Switch to Git view via View Diff button
+	if err := tt.Click("View Diff"); err != nil {
 		t.Fatalf("Click View Diff: %v", err)
 	}
-	if a.activeTab != tabGit {
-		t.Fatalf("expected activeTab == tabGit, got %d", a.activeTab)
+	if a.activeMode != modeGit {
+		t.Fatalf("expected activeMode == modeGit, got %d", a.activeMode)
 	}
-	if !tt.HasText("SOURCE CONTROL") || !tt.HasText("feat: initial commit") {
+	if !tt.HasText("CHANGES (1)") || !tt.HasText("feat: initial commit") {
 		t.Fatalf("Git view missing expected texts: %v", tt.Texts())
+	}
+}
+
+func TestDiffSeparatorDoesNotBlockScroll(t *testing.T) {
+	var oldLines, newLines []string
+	for i := 1; i <= 200; i++ {
+		oldLines = append(oldLines, fmt.Sprintf("line %d", i))
+		if i%25 == 2 {
+			newLines = append(newLines, fmt.Sprintf("line %d modified", i))
+		} else {
+			newLines = append(newLines, fmt.Sprintf("line %d", i))
+		}
+	}
+	dir := t.TempDir()
+	a := newApp(dir)
+	a.repo = &RepoSnapshot{
+		Root:        dir,
+		Branch:      "main",
+		StatusByRel: map[string]string{},
+		TreeDirs:    map[string][]string{},
+	}
+	a.activeMode = modeGit
+	a.diffKind = diffWorking
+	a.diffTitle = "scroll.go"
+	a.setDiffBuffers("scroll.go", strings.Join(oldLines, "\n"), strings.Join(newLines, "\n"))
+
+	tt := ui.NewTester(a.view, 1200, 320)
+	// Find the "18 unmodified lines" separator text
+	sepRectBefore, ok := tt.Find("18 unmodified lines")
+	if !ok {
+		t.Fatalf("expected '18 unmodified lines' separator in view, got texts: %v", tt.Texts())
+	}
+
+	// Scroll directly on top of the "18 unmodified lines" text
+	tt.Scroll(sepRectBefore.X+sepRectBefore.W/2, sepRectBefore.Y+sepRectBefore.H/2, 0, 80)
+	tt.Frame()
+
+	sepRectAfter, ok := tt.Find("18 unmodified lines")
+	if !ok {
+		t.Fatalf("separator disappeared after small scroll")
+	}
+	if sepRectAfter.Y >= sepRectBefore.Y {
+		t.Fatalf("scrolling over separator did not move diff: Y before=%v, Y after=%v", sepRectBefore.Y, sepRectAfter.Y)
+	}
+
+	// Clicking the expand icon button on the separator still expands the collapsed lines
+	if err := tt.Click("Expand 18 unmodified lines"); err != nil {
+		t.Fatalf("Click expand separator button: %v", err)
 	}
 }
