@@ -1,0 +1,6 @@
+{
+  "name": "arbor",
+  "identifier": "com.example.arbor",
+  "version": "0.1.0",
+  "out": "build"
+}
