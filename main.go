@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/egoist/mygo"
 	"github.com/egoist/mygo/ui"
@@ -35,10 +36,12 @@ type app struct {
 	busyText string
 
 	// Global UI state
-	activeMode  int // 0 = Files, 1 = Git
-	sidebarW    float32
+	activeMode    int // 0 = Files, 1 = Git
+	sidebarW      float32
 	newBranchOpen bool
 	newBranchName string
+	contentSeq    uint64
+	loadSeq       uint64
 
 	// Mode 0: Files (Explorer) state
 	openDirs      map[string]bool
@@ -50,6 +53,8 @@ type app struct {
 	codeSoftWrap  bool
 
 	// Mode 1: Git (Source Control + Graph) state
+	gitChangesH     float32
+	changesList     ui.ListState
 	gitList         ui.ListState
 	commitMsg       string
 	changesOpen     bool
@@ -85,6 +90,7 @@ func newApp(initialDir string) *app {
 		repoDir:         initialDir,
 		activeMode:      modeFiles,
 		sidebarW:        280,
+		gitChangesH:     200,
 		openDirs:        make(map[string]bool),
 		changesOpen:     true,
 		commitsOpen:     true,
@@ -122,11 +128,20 @@ func newApp(initialDir string) *app {
 						btn := ui.ButtonBase(c).Key("expand").Size(20, 20).Radius(4).Center().
 							Cursor(ui.CursorPointer).Label(fmt.Sprintf("Expand %d unmodified lines", s.Lines)).
 							Tooltip(fmt.Sprintf("Expand %d unmodified lines", s.Lines))
-						if btn.Hovered() {
-							btn.Background(t.SurfacePressed).TextColor(t.Text)
-						} else {
-							btn.TextColor(t.TextMuted)
+						btnBg := t.Surface.Alpha(0)
+						btnFg := t.TextMuted
+						btnScale := float32(1.0)
+						if btn.Pressed() {
+							btnBg = t.SurfacePressed
+							btnFg = t.Text
+							btnScale = 0.92
+						} else if btn.Hovered() {
+							btnBg = t.SurfacePressed
+							btnFg = t.Text
 						}
+						btn.Background(btn.AnimateColor("bg", btnBg, microColorAnim)).
+							TextColor(btn.AnimateColor("fg", btnFg, microColorAnim)).
+							AnimatePose(ui.Pose{Scale: btnScale}, poseAnim)
 						btn.Children(func() {
 							ui.Icon(c, IconExpand).Size(12, 12)
 						})
@@ -151,6 +166,43 @@ func newApp(initialDir string) *app {
 
 func (a *app) refreshRepo() {
 	snap, err := LoadRepo(a.repoDir)
+	a.applyRepoSnapshot(snap, err)
+}
+
+func (a *app) reloadRepoAsync(dir string) {
+	if dir != "" {
+		a.repoDir = dir
+	}
+	if a.win == nil {
+		a.refreshRepo()
+		return
+	}
+	a.loadSeq++
+	seq := a.loadSeq
+	targetDir := a.repoDir
+	a.busyText = "Loading…"
+	go func() {
+		snap, err := LoadRepo(targetDir)
+		a.win.Update(func() {
+			if a.loadSeq != seq {
+				return
+			}
+			a.busyText = ""
+			a.applyRepoSnapshot(snap, err)
+		})
+	}()
+}
+
+func isPreferredSourceFile(p string) bool {
+	for _, ext := range []string{".go", ".md", ".py", ".ts", ".tsx", ".js", ".rs", ".toml", ".yaml", ".yml"} {
+		if strings.HasSuffix(p, ext) {
+			return true
+		}
+	}
+	return false
+}
+
+func (a *app) applyRepoSnapshot(snap *RepoSnapshot, err error) {
 	if err != nil {
 		a.repo = nil
 		a.repoErr = err.Error()
@@ -174,7 +226,7 @@ func (a *app) refreshRepo() {
 	if a.selectedFile == "" && len(snap.AllFiles) > 0 {
 		pick := snap.AllFiles[0]
 		for _, f := range snap.AllFiles {
-			if strings.HasSuffix(f, "main.go") || strings.HasSuffix(f, ".go") {
+			if strings.HasSuffix(f, "main.go") || strings.EqualFold(filepath.Base(f), "README.md") || isPreferredSourceFile(f) {
 				pick = f
 				break
 			}
@@ -237,11 +289,17 @@ func (a *app) runAsyncGit(label string, fn func(root string) error) {
 		a.refreshRepo()
 		return
 	}
+	a.loadSeq++
+	seq := a.loadSeq
 	go func() {
 		_ = fn(root)
+		snap, err := LoadRepo(root)
 		a.win.Update(func() {
+			if a.loadSeq != seq {
+				return
+			}
 			a.busyText = ""
-			a.refreshRepo()
+			a.applyRepoSnapshot(snap, err)
 		})
 	}()
 }
@@ -252,6 +310,9 @@ func (a *app) selectExplorerFile(relPath string) {
 	}
 	if _, isDir := a.repo.TreeDirs[relPath]; isDir {
 		return
+	}
+	if a.selectedFile != relPath {
+		a.contentSeq++
 	}
 	a.selectedFile = relPath
 	content := ReadWorktreeFile(a.repo.Root, relPath)
@@ -268,6 +329,9 @@ func (a *app) selectExplorerFile(relPath string) {
 func (a *app) selectWorkingFile(st FileStatus) {
 	if a.repo == nil {
 		return
+	}
+	if a.diffKind != diffWorking || a.diffTitle != st.Path || (a.diffFileStat != nil && a.diffFileStat.Staged != st.Staged) {
+		a.contentSeq++
 	}
 	stCopy := st
 	a.diffKind = diffWorking
@@ -304,6 +368,9 @@ func (a *app) selectCommitFile(fIdx int) {
 	if a.repo == nil || a.selectedCommit == nil || fIdx < 0 || fIdx >= len(a.commitFiles) {
 		return
 	}
+	if a.diffKind != diffCommitFile || a.selectedCommitF != fIdx {
+		a.contentSeq++
+	}
 	a.selectedCommitF = fIdx
 	cf := a.commitFiles[fIdx]
 	a.diffKind = diffCommitFile
@@ -324,7 +391,7 @@ func (a *app) setDiffBuffers(path, oldText, newText string) {
 
 func applyLinearTheme(c *ui.Context) *ui.Theme {
 	t := *c.Theme()
-	t.Spacing = 3
+	t.Spacing = 4
 	t.Radius = 6
 	t.FontSize = 13
 	t.ScrollbarWidth = 5
@@ -388,14 +455,16 @@ func (a *app) view(c *ui.Context) {
 	}
 
 	// Global keyboard shortcuts
-	if c.Shortcut(ui.Cmd, ui.Key1) {
+	if c.Shortcut(ui.Cmd, ui.Key1) && a.activeMode != modeFiles {
 		a.activeMode = modeFiles
+		a.contentSeq++
 	}
-	if c.Shortcut(ui.Cmd, ui.Key2) {
+	if c.Shortcut(ui.Cmd, ui.Key2) && a.activeMode != modeGit {
 		a.activeMode = modeGit
+		a.contentSeq++
 	}
 	if c.Shortcut(ui.Cmd, ui.KeyR) {
-		a.refreshRepo()
+		a.reloadRepoAsync(a.repoDir)
 	}
 	if c.Shortcut(ui.Cmd, ui.KeyF) {
 		if a.activeMode == modeFiles {
@@ -405,11 +474,13 @@ func (a *app) view(c *ui.Context) {
 		}
 	}
 
+	a.sidebarW = min(max(a.sidebarW, 252), 540)
 	ui.Split(c, &a.sidebarW, func() {
 		a.sidebarView(c, t)
 	}, func() {
 		a.mainPaneView(c, t)
 	}).Fill()
+	a.sidebarW = min(max(a.sidebarW, 252), 540)
 
 	a.modalsView(c, t)
 }
@@ -431,26 +502,24 @@ func (a *app) sidebarView(c *ui.Context, t *ui.Theme) {
 		ui.Row(c).Height(headerHeight).FillWidth().Padding(0, 8, 0, leftInset).Gap(4).
 			AlignItems(ui.Center).BorderWidth(0, 0, 1, 0).BorderColor(t.Border).DragWindow().Children(func() {
 
-			// Segmented pill switcher
-			ui.Row(c).Padding(2).Radius(6).Background(t.Background.Alpha(0.55)).Border(1, t.Border).Gap(2).Children(func() {
-				if ghostBtn(c, "tab-files", IconFiles, "Files", "Explorer (⌘1)", a.activeMode == modeFiles) {
-					a.activeMode = modeFiles
-				}
-				gitLabel := "Git"
-				if a.repo != nil {
-					if n := len(a.repo.Staged) + len(a.repo.Unstaged); n > 0 {
-						gitLabel = fmt.Sprintf("Git · %d", n)
-					}
-				}
-				if ghostBtn(c, "tab-git", IconGitBranch, gitLabel, "Source Control & Graph (⌘2)", a.activeMode == modeGit) {
-					a.activeMode = modeGit
+			gitBadge := 0
+			if a.repo != nil {
+				gitBadge = len(a.repo.Staged) + len(a.repo.Unstaged)
+			}
+			segmentedModeSwitcher(c, a.activeMode, gitBadge, func(mode int) {
+				if a.activeMode != mode {
+					a.activeMode = mode
+					a.contentSeq++
 				}
 			})
 
 			ui.Spacer(c)
 
-			if iconBtn(c, "btn-refresh", IconRefresh, "Refresh (⌘R)", false) {
-				a.refreshRepo()
+			if a.busyText != "" {
+				ui.Spinner(c).Label(a.busyText)
+			}
+			if iconBtn(c, "btn-refresh", IconRefresh, "Refresh (⌘R)", a.busyText != "") {
+				a.reloadRepoAsync(a.repoDir)
 			}
 		})
 
@@ -466,20 +535,26 @@ func (a *app) sidebarView(c *ui.Context, t *ui.Theme) {
 
 		// 2. Compact Repository & Branch Bar
 		ui.Row(c).Height(34).FillWidth().Padding(0, 8).Gap(4).AlignItems(ui.Center).
-			BorderWidth(0, 0, 1, 0).BorderColor(t.Border).Children(func() {
+			BorderWidth(0, 0, 1, 0).BorderColor(t.Border).Clip().Children(func() {
 
 			repoName := filepath.Base(a.repo.Root)
 			if ghostBtn(c, "btn-repo", IconFolder, repoName, a.repo.Root+" (Click to switch repository)", false) {
 				a.openRepoDialog()
 			}
 
-			ghostMenuBtn(c, "btn-branch", IconGitBranch, a.repo.Branch, "Switch or create branch", func(m *ui.Menu) {
+			ghostMenuBtn(c, "btn-branch", IconGitBranch, a.repo.Branch, "Switch or create branch ("+a.repo.Branch+")", func(m *ui.Menu) {
 				if m.Item("+ New Branch…").Chosen() {
 					a.newBranchName = ""
 					a.newBranchOpen = true
 				}
 				m.Separator()
-				for _, br := range a.repo.Branches {
+				const maxMenuBranches = 40
+				shownCurrent := false
+				limit := min(len(a.repo.Branches), maxMenuBranches)
+				for _, br := range a.repo.Branches[:limit] {
+					if br == a.repo.Branch {
+						shownCurrent = true
+					}
 					if m.Item(br).Radio(br == a.repo.Branch).Chosen() && br != a.repo.Branch {
 						target := br
 						a.runAsyncGit("Checkout "+target, func(root string) error {
@@ -487,14 +562,25 @@ func (a *app) sidebarView(c *ui.Context, t *ui.Theme) {
 						})
 					}
 				}
+				if !shownCurrent && a.repo.Branch != "" {
+					m.Item(a.repo.Branch).Radio(true)
+				}
 			})
 
 			ui.Spacer(c)
 
-			if iconBtn(c, "btn-pull", IconArrowDown, "Pull (git pull --rebase)", false) {
+			pullTip := "Pull (git pull --rebase)"
+			if a.repo.Behind > 0 {
+				pullTip = fmt.Sprintf("Pull (%d behind)", a.repo.Behind)
+			}
+			if iconBtn(c, "btn-pull", IconArrowDown, pullTip, a.repo.Behind > 0) {
 				a.runAsyncGit("Pull", GitPull)
 			}
-			if iconBtn(c, "btn-push", IconArrowUp, "Push (git push)", false) {
+			pushTip := "Push (git push)"
+			if a.repo.Ahead > 0 {
+				pushTip = fmt.Sprintf("Push (%d ahead)", a.repo.Ahead)
+			}
+			if iconBtn(c, "btn-push", IconArrowUp, pushTip, a.repo.Ahead > 0) {
 				a.runAsyncGit("Push", GitPush)
 			}
 		})
@@ -582,10 +668,41 @@ func (a *app) filesSidebarBody(c *ui.Context, t *ui.Theme) {
 			Padding(0, 8, 0, float32(6+n.depth*14)).Gap(6).Radius(5).
 			AlignItems(ui.Center).Cursor(ui.CursorPointer)
 
+		hovered := row.Hovered()
+		pressed := row.Pressed()
+
+		targetBg := t.Surface.Alpha(0)
+		targetBd := t.Accent.Alpha(0)
 		if selected {
-			row.Background(t.Accent.Alpha(0.10)).TextColor(t.Text)
-		} else if row.Hovered() {
-			row.Background(t.SurfaceHover)
+			targetBg = t.Accent.Alpha(0.09)
+			targetBd = t.Accent.Alpha(0.20)
+			if pressed {
+				targetBg = t.Accent.Alpha(0.14)
+			} else if hovered {
+				targetBg = t.Accent.Alpha(0.12)
+			}
+		} else if pressed {
+			targetBg = t.SurfacePressed
+		} else if hovered {
+			targetBg = t.SurfaceHover
+		}
+		rowScale := float32(1.0)
+		if pressed {
+			rowScale = 0.985
+		}
+		row.Background(row.AnimateColor("bg", targetBg, microColorAnim)).
+			Border(1, row.AnimateColor("bd", targetBd, microColorAnim)).
+			AnimatePose(ui.Pose{Scale: rowScale}, poseAnim)
+
+		targetInd := float32(0)
+		if selected {
+			targetInd = 13
+		}
+		if indH := row.Spring("ind", targetInd, snappySpring); indH > 0.4 {
+			accent := t.Accent
+			row.DrawOver(func(p *ui.Painter, r ui.Rect) {
+				p.Fill(ui.Rect{X: r.X + 1.5, Y: r.Y + (r.H-indH)/2, W: 2.5, H: indH}, accent.Alpha(min(indH/13, 1)), 1.2)
+			})
 		}
 
 		if row.Clicked() {
@@ -596,98 +713,99 @@ func (a *app) filesSidebarBody(c *ui.Context, t *ui.Theme) {
 			}
 		}
 
+		nudgeX := float32(0)
+		if hovered && !selected {
+			nudgeX = 2.0
+		} else if selected {
+			nudgeX = 1.0
+		}
+
 		row.Children(func() {
 			if n.isDir {
 				chev := ui.Icon(c, IconChevronRight).Size(12, 12).TextColor(t.TextMuted)
+				rotTarget := float32(0)
 				if n.open {
-					chev.Rotate(90)
+					rotTarget = 90
 				}
+				chev.Rotate(chev.Spring("rot", rotTarget, snappySpring))
 				folderIc := IconFolder
+				folderCol := t.TextMuted
+				folderScale := float32(1.0)
 				if n.open {
 					folderIc = IconFolderOpen
+					folderCol = t.Accent.Alpha(0.85)
 				}
-				ui.Icon(c, folderIc).Size(14, 14).TextColor(t.TextMuted)
-				ui.Text(c, n.name).FontSize(12.5).SingleLine().Grow(1)
+				if hovered {
+					folderScale = 1.1
+					folderCol = t.Accent
+				}
+				fic := ui.Icon(c, folderIc).Size(14, 14)
+				fic.TextColor(fic.AnimateColor("fc", folderCol, microColorAnim)).
+					AnimatePose(ui.Pose{X: nudgeX * 0.5, Scale: folderScale}, snappyPoseAnim)
+
+				lbl := ui.Text(c, n.name).FontSize(12.5).SingleLine().Grow(1)
+				lbl.Translate(lbl.Spring("x", nudgeX, microSpring), 0)
 				if n.badge != "" {
-					ui.Box(c).Size(5, 5).Radius(3).Background(t.Warning)
+					dot := ui.Box(c).Size(5.5, 5.5).Radius(3).Background(t.Warning)
+					dotScale := float32(1.0)
+					if hovered {
+						dotScale = 1.25
+					}
+					dot.AnimatePose(ui.Pose{Scale: dotScale}, snappyPoseAnim)
 				}
 			} else {
 				ui.Box(c).Width(12) // align with folder chevron
-				icColor := t.TextMuted
-				if selected {
-					icColor = t.Accent
-				}
-				ui.Icon(c, iconForFile(n.path)).Size(14, 14).TextColor(icColor)
+				renderFileIcon(c, n.path, 14, selected, hovered)
 				lbl := ui.Text(c, n.name).FontSize(12.5).SingleLine().Grow(1)
+				lbl.Translate(lbl.Spring("x", nudgeX, microSpring), 0)
 				if selected {
 					lbl.FontWeight(500)
 				}
-				renderStatusBadge(c, n.badge)
+				renderStatusBadge(c, n.badge, selected || hovered)
 			}
 		})
-	}).Grow(1).Gap(3).Padding(6, 8)
+	}).Grow(1).MinHeight(0).Gap(3).Padding(6, 8)
 }
 
 type gitRowKind int
 
 const (
-	gitRowSectionChanges gitRowKind = iota
-	gitRowWorkingFile
-	gitRowSectionCommits
-	gitRowCommit
+	gitRowCommit gitRowKind = iota
 	gitRowCommitFile
 )
 
-type gitSidebarRow struct {
+type gitCommitRow struct {
 	kind       gitRowKind
 	key        string
-	fileStatus FileStatus
 	commitIdx  int
 	commitFile CommitFile
 	cfIndex    int
 }
 
-func (a *app) buildGitSidebarRows() []gitSidebarRow {
-	var rows []gitSidebarRow
+func (a *app) buildWorkingChangeRows() []FileStatus {
+	rows := make([]FileStatus, 0, len(a.repo.Staged)+len(a.repo.Unstaged))
+	rows = append(rows, a.repo.Staged...)
+	rows = append(rows, a.repo.Unstaged...)
+	return rows
+}
 
-	// 1. Changes Section
-	rows = append(rows, gitSidebarRow{kind: gitRowSectionChanges, key: "sec:changes"})
-	if a.changesOpen {
-		for _, st := range a.repo.Staged {
-			rows = append(rows, gitSidebarRow{
-				kind:       gitRowWorkingFile,
-				key:        "staged:" + st.Path,
-				fileStatus: st,
-			})
-		}
-		for _, st := range a.repo.Unstaged {
-			rows = append(rows, gitSidebarRow{
-				kind:       gitRowWorkingFile,
-				key:        "work:" + st.Path,
-				fileStatus: st,
-			})
-		}
-	}
-
-	// 2. Commits (Git Graph) Section
-	rows = append(rows, gitSidebarRow{kind: gitRowSectionCommits, key: "sec:commits"})
-	if a.commitsOpen {
-		for i, cm := range a.repo.Commits {
-			rows = append(rows, gitSidebarRow{
-				kind:      gitRowCommit,
-				key:       "commit:" + cm.Hash,
-				commitIdx: i,
-			})
-			if a.expandedCommit == cm.Hash {
-				for cfIdx, cf := range a.commitFiles {
-					rows = append(rows, gitSidebarRow{
-						kind:       gitRowCommitFile,
-						key:        "cf:" + cm.Hash + ":" + cf.Path,
-						commitIdx:  i,
-						commitFile: cf,
-						cfIndex:    cfIdx,
-					})
-				}
+func (a *app) buildCommitGraphRows() []gitCommitRow {
+	rows := make([]gitCommitRow, 0, len(a.repo.Commits)+len(a.commitFiles))
+	for i, cm := range a.repo.Commits {
+		rows = append(rows, gitCommitRow{
+			kind:      gitRowCommit,
+			key:       "commit:" + cm.Hash,
+			commitIdx: i,
+		})
+		if a.expandedCommit == cm.Hash {
+			for cfIdx, cf := range a.commitFiles {
+				rows = append(rows, gitCommitRow{
+					kind:       gitRowCommitFile,
+					key:        "cf:" + cm.Hash + ":" + cf.Path,
+					commitIdx:  i,
+					commitFile: cf,
+					cfIndex:    cfIdx,
+				})
 			}
 		}
 	}
@@ -698,7 +816,7 @@ func (a *app) gitSidebarBody(c *ui.Context, t *ui.Theme) {
 	totalChanges := len(a.repo.Staged) + len(a.repo.Unstaged)
 
 	// Compact Commit Bar
-	ui.Row(c).Padding(6, 8).Gap(6).AlignItems(ui.Center).
+	ui.Row(c).Shrink(0).Padding(6, 8).Gap(6).AlignItems(ui.Center).
 		BorderWidth(0, 0, 1, 0).BorderColor(t.Border).Children(func() {
 		sub := compactInput(c, "commit-msg", IconGitCommit, &a.commitMsg, "Commit message…")
 		canCommit := strings.TrimSpace(a.commitMsg) != "" && totalChanges > 0
@@ -717,44 +835,86 @@ func (a *app) gitSidebarBody(c *ui.Context, t *ui.Theme) {
 		}
 	})
 
-	rows := a.buildGitSidebarRows()
-	a.gitList.Key = func(i int) any { return rows[i].key }
+	if a.changesOpen && a.commitsOpen {
+		ui.SplitVertical(c, &a.gitChangesH, func() {
+			a.gitChangesSection(c, t, totalChanges)
+		}, func() {
+			a.gitCommitsSection(c, t, false)
+		}).Grow(1).MinHeight(0)
+		return
+	}
 
+	a.gitChangesSection(c, t, totalChanges)
+	a.gitCommitsSection(c, t, true)
+}
+
+func (a *app) gitChangesSection(c *ui.Context, t *ui.Theme, totalChanges int) {
+	a.renderChangesSectionHeader(c, t, totalChanges)
+	if !a.changesOpen {
+		return
+	}
+	changes := a.buildWorkingChangeRows()
+	a.changesList.Key = func(i int) any {
+		st := changes[i]
+		if st.Staged {
+			return "staged:" + st.Path
+		}
+		return "work:" + st.Path
+	}
+	ui.List(c, &a.changesList, len(changes), func(i int) {
+		a.renderWorkingFileRow(c, t, changes[i])
+	}).Grow(1).MinHeight(0).PaddingY(2)
+}
+
+func (a *app) gitCommitsSection(c *ui.Context, t *ui.Theme, topBorder bool) {
+	a.renderCommitsSectionHeader(c, t, topBorder)
+	if !a.commitsOpen {
+		return
+	}
+	rows := a.buildCommitGraphRows()
+	a.gitList.Key = func(i int) any { return rows[i].key }
 	ui.List(c, &a.gitList, len(rows), func(i int) {
 		r := rows[i]
-		switch r.kind {
-		case gitRowSectionChanges:
-			a.renderChangesSectionHeader(c, t, totalChanges)
-		case gitRowWorkingFile:
-			a.renderWorkingFileRow(c, t, r.fileStatus)
-		case gitRowSectionCommits:
-			a.renderCommitsSectionHeader(c, t)
-		case gitRowCommit:
+		if r.kind == gitRowCommit {
 			a.renderCommitGraphRow(c, t, r.commitIdx)
-		case gitRowCommitFile:
+		} else {
 			a.renderCommitFileRow(c, t, r.commitIdx, r.cfIndex, r.commitFile)
 		}
-	}).Grow(1).PaddingY(2)
+	}).Grow(1).MinHeight(0).PaddingY(2)
 }
 
 func (a *app) renderChangesSectionHeader(c *ui.Context, t *ui.Theme, count int) {
-	hdr := ui.Row(c.Key("hdr-changes")).Height(28).Padding(0, 8).Gap(6).
+	hdr := ui.Row(c.Key("hdr-changes")).Height(28).Shrink(0).Padding(0, 8).Gap(6).
 		AlignItems(ui.Center).Cursor(ui.CursorPointer)
+	fgTarget := t.TextMuted
+	if hdr.Hovered() {
+		fgTarget = t.Text
+	}
+	fg := hdr.AnimateColor("fg", fgTarget, microColorAnim)
 	actionClicked := false
 	hdr.Children(func() {
-		chev := ui.Icon(c, IconChevronRight).Size(12, 12).TextColor(t.TextMuted)
+		chev := ui.Icon(c, IconChevronRight).Size(12, 12).TextColor(fg)
+		rotTarget := float32(0)
 		if a.changesOpen {
-			chev.Rotate(90)
+			rotTarget = 90
 		}
-		ui.Textf(c, "CHANGES (%d)", count).FontSize(11).Bold().TextColor(t.TextMuted).Grow(1)
+		chev.Rotate(chev.Spring("rot", rotTarget, snappySpring))
+		ui.Text(c, "CHANGES").FontSize(11).Bold().TextColor(fg)
+		if count > 0 {
+			ui.Row(c).Padding(0.5, 5).Radius(6).Background(t.Accent.Alpha(0.14)).Children(func() {
+				ui.Textf(c, "%d", count).Key("chg-cnt").Font("monospace").FontSize(10).Bold().TextColor(t.Accent).
+					ContentTransition(ui.ContentTransition{Numeric: true})
+			})
+		}
+		ui.Spacer(c)
 		if len(a.repo.Staged) > 0 {
-			if rowIconBtn(c, "unstage-all", IconMinus, "Unstage All") {
+			if rowActionBtn(c, "unstage-all", IconMinus, "Unstage All", actionToneWarning) {
 				actionClicked = true
 				a.runAsyncGit("Unstage All", GitUnstageAll)
 			}
 		}
 		if len(a.repo.Unstaged) > 0 {
-			if rowIconBtn(c, "stage-all", IconPlus, "Stage All") {
+			if rowActionBtn(c, "stage-all", IconPlus, "Stage All", actionToneSuccess) {
 				actionClicked = true
 				a.runAsyncGit("Stage All", GitStageAll)
 			}
@@ -773,55 +933,103 @@ func (a *app) renderWorkingFileRow(c *ui.Context, t *ui.Theme, st FileStatus) {
 	row := ui.Row(c.Key(rowKey)).Height(24).Padding(0, 8, 0, 12).Gap(6).
 		Radius(5).Margin(1.5, 8).AlignItems(ui.Center).Cursor(ui.CursorPointer)
 	hovered := row.Hovered()
+	pressed := row.Pressed()
+	targetBg := t.Surface.Alpha(0)
+	targetBd := t.Accent.Alpha(0)
 	if selected {
-		row.Background(t.Accent.Alpha(0.10)).TextColor(t.Text)
+		targetBg = t.Accent.Alpha(0.09)
+		targetBd = t.Accent.Alpha(0.20)
+		if pressed {
+			targetBg = t.Accent.Alpha(0.14)
+		} else if hovered {
+			targetBg = t.Accent.Alpha(0.12)
+		}
+	} else if pressed {
+		targetBg = t.SurfacePressed
 	} else if hovered {
-		row.Background(t.SurfaceHover)
+		targetBg = t.SurfaceHover
 	}
+	rowScale := float32(1.0)
+	if pressed {
+		rowScale = 0.985
+	}
+	row.Background(row.AnimateColor("bg", targetBg, microColorAnim)).
+		Border(1, row.AnimateColor("bd", targetBd, microColorAnim)).
+		AnimatePose(ui.Pose{Scale: rowScale}, poseAnim)
+
+	targetInd := float32(0)
+	if selected {
+		targetInd = 13
+	}
+	if indH := row.Spring("ind", targetInd, snappySpring); indH > 0.4 {
+		accent := t.Accent
+		row.DrawOver(func(p *ui.Painter, r ui.Rect) {
+			p.Fill(ui.Rect{X: r.X + 1.5, Y: r.Y + (r.H-indH)/2, W: 2.5, H: indH}, accent.Alpha(min(indH/13, 1)), 1.2)
+		})
+	}
+
+	nudgeX := float32(0)
+	if hovered && !selected {
+		nudgeX = 2.0
+	} else if selected {
+		nudgeX = 1.0
+	}
+
+	trayTarget := float32(0)
+	if hovered {
+		trayTarget = 1
+	}
+	trayK := row.Spring("tray", trayTarget, microSpring)
 
 	actionClicked := false
 	row.Children(func() {
-		icColor := t.TextMuted
-		if selected {
-			icColor = t.Accent
-		}
-		ui.Icon(c, iconForFile(st.Path)).Size(14, 14).TextColor(icColor).Shrink(0)
+		renderFileIcon(c, st.Path, 14, selected, hovered)
 		lbl := ui.Text(c, filepath.Base(st.Path)).FontSize(12.5).SingleLine().Shrink(0)
+		lbl.Translate(lbl.Spring("x", nudgeX, microSpring), 0)
 		if selected {
 			lbl.FontWeight(500)
 		}
 		dir := filepath.Dir(st.Path)
-		if dir != "." && !hovered {
-			ui.Text(c, dir).FontSize(11).TextColor(t.TextMuted).SingleLine().Grow(1)
+		if dir != "." && trayK < 0.5 {
+			ui.Text(c, dir).FontSize(11).TextColor(t.TextMuted).Opacity(1 - trayK*1.6).SingleLine().Grow(1).Shrink(1).MinWidth(0).Clip()
 		} else {
 			ui.Spacer(c)
 		}
-		if st.Staged && !hovered {
-			ui.Row(c).Padding(1, 4).Radius(3).Background(t.Success.Alpha(0.15)).Children(func() {
+		if st.Staged && trayK < 0.6 {
+			ui.Row(c).Padding(1, 4).Radius(3).Background(t.Success.Alpha(0.15)).Opacity(1 - trayK*1.5).Children(func() {
 				ui.Text(c, "staged").FontSize(9).TextColor(t.Success)
 			})
 		}
-		if hovered {
+		if trayK > 0.02 {
+			fullW := float32(42)
 			if st.Staged {
-				if rowIconBtn(c, "unstage:"+st.Path, IconMinus, "Unstage") {
-					actionClicked = true
-					p := st.Path
-					a.runAsyncGit("Unstage", func(root string) error { return GitUnstageFile(root, p) })
-				}
-			} else {
-				if rowIconBtn(c, "discard:"+st.Path, IconUndo, "Discard changes") {
-					actionClicked = true
-					target := st
-					a.runAsyncGit("Discard", func(root string) error { return GitDiscardFile(root, target) })
-				}
-				if rowIconBtn(c, "stage:"+st.Path, IconPlus, "Stage") {
-					actionClicked = true
-					p := st.Path
-					a.runAsyncGit("Stage", func(root string) error { return GitStageFile(root, p) })
-				}
+				fullW = 20
 			}
+			tray := ui.Row(c).Width(fullW * trayK).Gap(2).AlignItems(ui.Center).Justify(ui.End).Clip().
+				Opacity(trayK)
+			tray.Translate((1-trayK)*8, 0)
+			tray.Children(func() {
+				if st.Staged {
+					if rowActionBtn(c, "unstage:"+st.Path, IconMinus, "Unstage", actionToneWarning) {
+						actionClicked = true
+						p := st.Path
+						a.runAsyncGit("Unstage", func(root string) error { return GitUnstageFile(root, p) })
+					}
+				} else {
+					if rowActionBtn(c, "discard:"+st.Path, IconUndo, "Discard changes", actionToneDanger) {
+						actionClicked = true
+						target := st
+						a.runAsyncGit("Discard", func(root string) error { return GitDiscardFile(root, target) })
+					}
+					if rowActionBtn(c, "stage:"+st.Path, IconPlus, "Stage", actionToneSuccess) {
+						actionClicked = true
+						p := st.Path
+						a.runAsyncGit("Stage", func(root string) error { return GitStageFile(root, p) })
+					}
+				}
+			})
 		}
-		renderStatusBadge(c, st.Badge())
+		renderStatusBadge(c, st.Badge(), selected || hovered)
 	})
 
 	if row.Clicked() && !actionClicked {
@@ -829,15 +1037,25 @@ func (a *app) renderWorkingFileRow(c *ui.Context, t *ui.Theme, st FileStatus) {
 	}
 }
 
-func (a *app) renderCommitsSectionHeader(c *ui.Context, t *ui.Theme) {
-	hdr := ui.Row(c.Key("hdr-commits")).Height(28).Padding(0, 8).Margin(4, 0, 0, 0).Gap(6).
-		AlignItems(ui.Center).BorderWidth(1, 0, 0, 0).BorderColor(t.Border).Cursor(ui.CursorPointer)
+func (a *app) renderCommitsSectionHeader(c *ui.Context, t *ui.Theme, topBorder bool) {
+	hdr := ui.Row(c.Key("hdr-commits")).Height(28).Shrink(0).Padding(0, 8).Gap(6).
+		AlignItems(ui.Center).Cursor(ui.CursorPointer)
+	if topBorder {
+		hdr.BorderWidth(1, 0, 0, 0).BorderColor(t.Border)
+	}
+	fgTarget := t.TextMuted
+	if hdr.Hovered() {
+		fgTarget = t.Text
+	}
+	fg := hdr.AnimateColor("fg", fgTarget, microColorAnim)
 	hdr.Children(func() {
-		chev := ui.Icon(c, IconChevronRight).Size(12, 12).TextColor(t.TextMuted)
+		chev := ui.Icon(c, IconChevronRight).Size(12, 12).TextColor(fg)
+		rotTarget := float32(0)
 		if a.commitsOpen {
-			chev.Rotate(90)
+			rotTarget = 90
 		}
-		ui.Textf(c, "GRAPH (%d)", len(a.repo.Commits)).FontSize(11).Bold().TextColor(t.TextMuted).Grow(1)
+		chev.Rotate(chev.Spring("rot", rotTarget, microSpring))
+		ui.Textf(c, "GRAPH (%d)", len(a.repo.Commits)).FontSize(11).Bold().TextColor(fg).Grow(1)
 	})
 	if hdr.Clicked() {
 		a.commitsOpen = !a.commitsOpen
@@ -849,22 +1067,43 @@ func (a *app) renderCommitGraphRow(c *ui.Context, t *ui.Theme, cIdx int) {
 	gRow := a.repo.Graph[cIdx]
 	expanded := a.expandedCommit == cm.Hash
 
-	graphW := float32(max(gRow.MaxCols, 1)*14 + 6)
-	if graphW > 96 {
-		graphW = 96
-	}
+	graphW := GraphCellWidth(gRow.MaxCols)
 
 	row := ui.Row(c.Key("cm:"+cm.Hash)).Height(30).Padding(0, 8, 0, 2).Gap(5).
-		Radius(5).Margin(0, 4).AlignItems(ui.Center).Cursor(ui.CursorPointer)
+		Radius(5).Margin(0, 4).AlignItems(ui.Center).Clip().Cursor(ui.CursorPointer).
+		Tooltip(cm.ShortHash + " · " + cm.Subject)
+	hovered := row.Hovered()
+	pressed := row.Pressed()
+
+	targetBg := t.Surface.Alpha(0)
 	if expanded {
-		row.Background(t.SurfaceHover)
-	} else if row.Hovered() {
-		row.Background(t.SurfaceHover.Alpha(0.6))
+		targetBg = t.SurfaceHover
+	} else if pressed {
+		targetBg = t.SurfacePressed
+	} else if hovered {
+		targetBg = t.SurfaceHover.Alpha(0.75)
 	}
+	rowScale := float32(1.0)
+	if pressed {
+		rowScale = 0.988
+	}
+	row.Background(row.AnimateColor("bg", targetBg, microColorAnim)).
+		AnimatePose(ui.Pose{Scale: rowScale}, poseAnim)
+
+	hoverTarget := float32(0)
+	if hovered {
+		hoverTarget = 1
+	}
+	expandTarget := float32(0)
+	if expanded {
+		expandTarget = 1
+	}
+	hoverK := row.Spring("hk", hoverTarget, microSpring)
+	expandK := row.Spring("ek", expandTarget, snappySpring)
 
 	row.Children(func() {
-		ui.Box(c).Width(graphW).FillHeight().Draw(func(p *ui.Painter, r ui.Rect) {
-			DrawGraphCell(p, r, gRow, t.Surface)
+		ui.Box(c).Width(graphW).Shrink(0).FillHeight().Clip().Draw(func(p *ui.Painter, r ui.Rect) {
+			DrawGraphCell(p, r, gRow, t.Surface, hoverK, expandK)
 		})
 
 		if len(cm.Refs) > 0 {
@@ -873,13 +1112,31 @@ func (a *app) renderCommitGraphRow(c *ui.Context, t *ui.Theme, cIdx int) {
 			if after, ok := strings.CutPrefix(refLabel, "HEAD -> "); ok {
 				refLabel = after
 			}
-			ui.Row(c).Padding(1, 5).Radius(4).Background(col.Alpha(0.16)).Children(func() {
-				ui.Text(c, refLabel).FontSize(10).Bold().TextColor(col).SingleLine()
+			refScale := float32(1.0)
+			if hovered || expanded {
+				refScale = 1.05
+			}
+			ui.Row(c).MaxWidth(88).Shrink(0).Padding(1, 5).Radius(4).Clip().
+				Background(col.Alpha(0.16 + 0.06*hoverK)).
+				AnimatePose(ui.Pose{Scale: refScale}, snappyPoseAnim).Children(func() {
+				ui.Text(c, refLabel).FontSize(10).Bold().TextColor(col).SingleLine().Shrink(1).MinWidth(0).Clip()
 			})
 		}
 
-		ui.Text(c, cm.Subject).SingleLine().Grow(1)
-		ui.Text(c, cm.ShortHash).Font("monospace").FontSize(10).TextColor(t.TextMuted).SingleLine()
+		subj := ui.Text(c, cm.Subject).FontSize(12).SingleLine().Grow(1).Shrink(1).MinWidth(0).Clip()
+		subj.Translate(1.5*hoverK, 0)
+		if expanded {
+			subj.FontWeight(500)
+		}
+
+		if a.sidebarW-graphW >= 180 {
+			hashColTarget := t.TextMuted
+			if hovered || expanded {
+				hashColTarget = t.Accent
+			}
+			hashTxt := ui.Text(c, cm.ShortHash).Font("monospace").FontSize(10).SingleLine().Shrink(0)
+			hashTxt.TextColor(hashTxt.AnimateColor("hc", hashColTarget, microColorAnim))
+		}
 	})
 
 	if row.Clicked() {
@@ -894,30 +1151,68 @@ func (a *app) renderCommitFileRow(c *ui.Context, t *ui.Theme, cIdx, cfIdx int, c
 
 	row := ui.Row(c.Key(fmt.Sprintf("cfr:%s:%d", cm.Hash, cfIdx))).Height(24).
 		Padding(0, 8, 0, 24).Gap(6).Radius(5).Margin(1.5, 8).
-		AlignItems(ui.Center).Cursor(ui.CursorPointer)
+		AlignItems(ui.Center).Cursor(ui.CursorPointer).
+		Transition(ui.ElementTransition{
+			Duration: 140 * time.Millisecond,
+			Enter:    &ui.Motion{Opacity: 0, Y: -3},
+		})
+	hovered := row.Hovered()
+	pressed := row.Pressed()
+	targetBg := t.Surface.Alpha(0)
+	targetBd := t.Accent.Alpha(0)
 	if selected {
-		row.Background(t.Accent.Alpha(0.10)).TextColor(t.Text)
-	} else if row.Hovered() {
-		row.Background(t.SurfaceHover)
+		targetBg = t.Accent.Alpha(0.09)
+		targetBd = t.Accent.Alpha(0.20)
+		if pressed {
+			targetBg = t.Accent.Alpha(0.14)
+		} else if hovered {
+			targetBg = t.Accent.Alpha(0.12)
+		}
+	} else if pressed {
+		targetBg = t.SurfacePressed
+	} else if hovered {
+		targetBg = t.SurfaceHover
+	}
+	rowScale := float32(1.0)
+	if pressed {
+		rowScale = 0.985
+	}
+	row.Background(row.AnimateColor("bg", targetBg, microColorAnim)).
+		Border(1, row.AnimateColor("bd", targetBd, microColorAnim)).
+		AnimatePose(ui.Pose{Scale: rowScale}, poseAnim)
+
+	targetInd := float32(0)
+	if selected {
+		targetInd = 13
+	}
+	if indH := row.Spring("ind", targetInd, snappySpring); indH > 0.4 {
+		accent := t.Accent
+		row.DrawOver(func(p *ui.Painter, r ui.Rect) {
+			p.Fill(ui.Rect{X: r.X + 1.5, Y: r.Y + (r.H-indH)/2, W: 2.5, H: indH}, accent.Alpha(min(indH/13, 1)), 1.2)
+		})
+	}
+
+	nudgeX := float32(0)
+	if hovered && !selected {
+		nudgeX = 2.0
+	} else if selected {
+		nudgeX = 1.0
 	}
 
 	row.Children(func() {
-		icColor := t.TextMuted
-		if selected {
-			icColor = t.Accent
-		}
-		ui.Icon(c, iconForFile(cf.Path)).Size(13, 13).TextColor(icColor).Shrink(0)
+		renderFileIcon(c, cf.Path, 13, selected, hovered)
 		lbl := ui.Text(c, filepath.Base(cf.Path)).FontSize(12).SingleLine().Shrink(0)
+		lbl.Translate(lbl.Spring("x", nudgeX, microSpring), 0)
 		if selected {
 			lbl.FontWeight(500)
 		}
 		dir := filepath.Dir(cf.Path)
 		if dir != "." {
-			ui.Text(c, dir).FontSize(10).TextColor(t.TextMuted).SingleLine().Grow(1)
+			ui.Text(c, dir).FontSize(10).TextColor(t.TextMuted).SingleLine().Grow(1).Shrink(1).MinWidth(0).Clip()
 		} else {
 			ui.Spacer(c)
 		}
-		renderStatusBadge(c, cf.Status)
+		renderStatusBadge(c, cf.Status, selected || hovered)
 	})
 
 	if row.Clicked() {
@@ -958,15 +1253,16 @@ func (a *app) filesMainPane(c *ui.Context, t *ui.Theme) {
 			return
 		}
 
-		ui.Icon(c, iconForFile(a.selectedFile)).Size(15, 15).TextColor(t.TextMuted)
+		renderFileIcon(c, a.selectedFile, 15, true, false)
 		dir := filepath.Dir(a.selectedFile)
 		if dir != "." {
-			ui.Text(c, dir+" /").TextColor(t.TextMuted).SingleLine()
+			ui.Text(c, dir+" /").TextColor(t.TextMuted).SingleLine().Shrink(1).MinWidth(0).Clip()
 		}
-		ui.Text(c, filepath.Base(a.selectedFile)).Bold().SingleLine()
+		ui.Text(c, filepath.Base(a.selectedFile)).Key("file-title").Bold().SingleLine().Shrink(0).
+			ContentTransition(ui.ContentTransition{})
 
 		badge := a.repo.StatusByRel[a.selectedFile]
-		renderStatusBadge(c, badge)
+		renderStatusBadge(c, badge, true)
 
 		ui.Spacer(c)
 
@@ -976,6 +1272,7 @@ func (a *app) filesMainPane(c *ui.Context, t *ui.Theme) {
 					if st.Path == a.selectedFile {
 						a.selectWorkingFile(st)
 						a.activeMode = modeGit
+						a.contentSeq++
 						return
 					}
 				}
@@ -983,6 +1280,7 @@ func (a *app) filesMainPane(c *ui.Context, t *ui.Theme) {
 					if st.Path == a.selectedFile {
 						a.selectWorkingFile(st)
 						a.activeMode = modeGit
+						a.contentSeq++
 						return
 					}
 				}
@@ -1006,7 +1304,15 @@ func (a *app) filesMainPane(c *ui.Context, t *ui.Theme) {
 
 	a.codeState.ReadOnly = true
 	a.codeState.SoftWrap = a.codeSoftWrap
-	editor.View(c, a.codeState).Grow(1).FillWidth()
+	edWrap := ui.Column(c.Key("code-viewport")).Grow(1).FillWidth()
+	k := edWrap.Keyframes("enter", []ui.Keyframe{
+		{At: 0, Value: 0},
+		{At: 140 * time.Millisecond, Value: 1, Ease: ui.EaseOut},
+	}, ui.KeyframeOptions{Run: a.contentSeq})
+	edWrap.Opacity(0.75 + 0.25*k).Translate(0, (1-k)*3)
+	edWrap.Children(func() {
+		editor.View(c, a.codeState).Grow(1).FillWidth()
+	})
 }
 
 func (a *app) gitMainPane(c *ui.Context, t *ui.Theme) {
@@ -1027,27 +1333,39 @@ func (a *app) gitMainPane(c *ui.Context, t *ui.Theme) {
 			return
 		}
 
-		ui.Icon(c, iconForFile(a.diffTitle)).Size(15, 15).TextColor(t.TextMuted)
+		renderFileIcon(c, a.diffTitle, 15, true, false)
 		dir := filepath.Dir(a.diffTitle)
 		if dir != "." {
-			ui.Text(c, dir+" /").TextColor(t.TextMuted).SingleLine()
+			ui.Text(c, dir+" /").TextColor(t.TextMuted).SingleLine().Shrink(1).MinWidth(0).Clip()
 		}
-		ui.Text(c, filepath.Base(a.diffTitle)).Bold().SingleLine()
-		renderStatusBadge(c, a.diffBadge)
+		ui.Text(c, filepath.Base(a.diffTitle)).Key("diff-title").Bold().SingleLine().Shrink(0).
+			ContentTransition(ui.ContentTransition{})
+		renderStatusBadge(c, a.diffBadge, true)
 
 		// Context pill (Working Tree vs Commit Hash)
 		if a.diffKind == diffCommitFile && a.selectedCommit != nil {
-			ui.Row(c).Padding(2, 6).Radius(4).Gap(4).AlignItems(ui.Center).Background(t.SurfaceHover).Children(func() {
-				ui.Icon(c, IconGitCommit).Size(12, 12).TextColor(t.Accent)
-				ui.Text(c, a.selectedCommit.ShortHash).Font("monospace").FontSize(11).TextColor(t.Accent)
-				ui.Text(c, a.selectedCommit.Subject).FontSize(11).TextColor(t.TextMuted).SingleLine()
+			ui.Row(c).Padding(2, 6).Radius(4).Gap(4).AlignItems(ui.Center).Shrink(1).MinWidth(0).Clip().
+				Background(t.SurfaceHover).Children(func() {
+				ui.Icon(c, IconGitCommit).Size(12, 12).Shrink(0).TextColor(t.Accent)
+				ui.Text(c, a.selectedCommit.ShortHash).Font("monospace").FontSize(11).Shrink(0).TextColor(t.Accent)
+				ui.Text(c, a.selectedCommit.Subject).FontSize(11).TextColor(t.TextMuted).SingleLine().Shrink(1).MinWidth(0).Clip()
 			})
 		}
 
 		if added > 0 || deleted > 0 {
-			ui.Row(c).Gap(4).Padding(2, 6).Radius(4).Background(t.SurfaceHover).Children(func() {
-				ui.Textf(c, "+%d", added).Font("monospace").FontSize(11).Bold().TextColor(t.Success)
-				ui.Textf(c, "−%d", deleted).Font("monospace").FontSize(11).Bold().TextColor(t.Danger)
+			ui.Row(c).Gap(4).AlignItems(ui.Center).Children(func() {
+				if added > 0 {
+					ui.Row(c).Padding(1.5, 5).Radius(4).Background(t.Success.Alpha(0.13)).Children(func() {
+						ui.Textf(c, "+%d", added).Key("diff-add").Font("monospace").FontSize(10.5).Bold().TextColor(t.Success).
+							ContentTransition(ui.ContentTransition{Numeric: true})
+					})
+				}
+				if deleted > 0 {
+					ui.Row(c).Padding(1.5, 5).Radius(4).Background(t.Danger.Alpha(0.13)).Children(func() {
+						ui.Textf(c, "−%d", deleted).Key("diff-del").Font("monospace").FontSize(10.5).Bold().TextColor(t.Danger).
+							ContentTransition(ui.ContentTransition{Numeric: true})
+					})
+				}
 			})
 		}
 
@@ -1067,6 +1385,7 @@ func (a *app) gitMainPane(c *ui.Context, t *ui.Theme) {
 			if ghostBtn(c, "diff-open-file", IconFiles, "File", "Read full file in Explorer", false) {
 				a.selectExplorerFile(st.Path)
 				a.activeMode = modeFiles
+				a.contentSeq++
 			}
 		}
 
@@ -1119,7 +1438,15 @@ func (a *app) gitMainPane(c *ui.Context, t *ui.Theme) {
 	} else {
 		a.diffState.Layout = editor.DiffUnified
 	}
-	editor.DiffView(c, a.diffState).Grow(1).FillWidth()
+	diffWrap := ui.Column(c.Key("diff-viewport")).Grow(1).FillWidth()
+	k := diffWrap.Keyframes("enter", []ui.Keyframe{
+		{At: 0, Value: 0},
+		{At: 140 * time.Millisecond, Value: 1, Ease: ui.EaseOut},
+	}, ui.KeyframeOptions{Run: a.contentSeq})
+	diffWrap.Opacity(0.75 + 0.25*k).Translate(0, (1-k)*3)
+	diffWrap.Children(func() {
+		editor.DiffView(c, a.diffState).Grow(1).FillWidth()
+	})
 }
 
 func (a *app) emptyRepoView(c *ui.Context, t *ui.Theme) {
@@ -1137,8 +1464,13 @@ func (a *app) emptyRepoView(c *ui.Context, t *ui.Theme) {
 
 func (a *app) modalsView(c *ui.Context, t *ui.Theme) {
 	ui.Modal(c, &a.newBranchOpen, func() {
-		ui.Column(c).Width(340).Padding(16).Gap(12).Radius(10).
-			Background(t.Surface).Border(1, t.Border).Children(func() {
+		ui.Column(c).Key("modal-new-branch").Width(340).Padding(16).Gap(12).Radius(10).
+			Background(t.Surface).Border(1, t.Border).
+			Transition(ui.ElementTransition{
+				Duration: 150 * time.Millisecond,
+				Enter:    &ui.Motion{Opacity: 0, Y: -6, Scale: 0.98},
+				Exit:     &ui.Motion{Opacity: 0, Y: -4, Scale: 0.98},
+			}).Children(func() {
 			ui.Row(c).Gap(6).AlignItems(ui.Center).Children(func() {
 				ui.Icon(c, IconGitBranch).Size(15, 15).TextColor(t.Accent)
 				ui.Text(c, "Create & Checkout Branch").FontSize(14).Bold()
@@ -1173,11 +1505,10 @@ func (a *app) openRepoDialog() {
 		picked := paths[0]
 		if a.win != nil {
 			a.win.Update(func() {
-				a.repoDir = picked
 				a.selectedFile = ""
 				a.diffKind = diffNone
 				a.openDirs = make(map[string]bool)
-				a.refreshRepo()
+				a.reloadRepoAsync(picked)
 			})
 		}
 	}()

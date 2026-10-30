@@ -3,12 +3,14 @@ package main
 import (
 	"bytes"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 )
 
 type FileStatus struct {
@@ -72,6 +74,26 @@ type RepoSnapshot struct {
 	Graph       []GraphRow
 }
 
+func findWorktreeDotGitRoot(dir string) string {
+	cur, err := filepath.Abs(dir)
+	if err != nil {
+		cur = filepath.Clean(dir)
+	}
+	for {
+		if st, err := os.Stat(filepath.Join(cur, ".git")); err == nil {
+			if st.IsDir() {
+				return cur
+			}
+			return ""
+		}
+		parent := filepath.Dir(cur)
+		if parent == cur {
+			return ""
+		}
+		cur = parent
+	}
+}
+
 func runGit(dir string, args ...string) (string, error) {
 	cmd := exec.Command("git", args...)
 	cmd.Dir = dir
@@ -79,6 +101,18 @@ func runGit(dir string, args ...string) (string, error) {
 	cmd.Stdout = &out
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
+		// Fallback when a hook/tool temporarily flips core.bare=true on a standard .git worktree
+		if root := findWorktreeDotGitRoot(dir); root != "" {
+			wtArgs := append([]string{"--git-dir=" + filepath.Join(root, ".git"), "--work-tree=" + root}, args...)
+			wtCmd := exec.Command("git", wtArgs...)
+			wtCmd.Dir = root
+			var wtOut, wtErr bytes.Buffer
+			wtCmd.Stdout = &wtOut
+			wtCmd.Stderr = &wtErr
+			if err2 := wtCmd.Run(); err2 == nil {
+				return wtOut.String(), nil
+			}
+		}
 		msg := strings.TrimSpace(stderr.String())
 		if msg == "" {
 			msg = err.Error()
@@ -104,13 +138,43 @@ func LoadRepo(dir string) (*RepoSnapshot, error) {
 		TreeDirs:    make(map[string][]string),
 	}
 
+	var (
+		bOut, brOut, stOut, logOut, lsOut string
+		bErr, brErr, stErr, logErr, lsErr error
+		wg                                sync.WaitGroup
+	)
+	wg.Add(5)
+	go func() {
+		defer wg.Done()
+		bOut, bErr = runGit(root, "status", "--porcelain=v2", "--branch", "-uall")
+	}()
+	go func() {
+		defer wg.Done()
+		brOut, brErr = runGit(root, "for-each-ref", "--sort=-committerdate", "refs/heads/", "--format=%(refname:short)")
+	}()
+	go func() {
+		defer wg.Done()
+		stOut, stErr = runGit(root, "stash", "list", "--format=%gd%x09%gs")
+	}()
+	go func() {
+		defer wg.Done()
+		// shortcut: caps log at 400 commits per load for instant frame times; increase or paginate for deep history
+		logOut, logErr = runGit(root, "log", "--all", "--topo-order", "--date=short", "-n", "400",
+			"--pretty=format:%H%x09%P%x09%h%x09%an%x09%ad%x09%D%x09%s")
+	}()
+	go func() {
+		defer wg.Done()
+		lsOut, lsErr = runGit(root, "ls-files", "-co", "--exclude-standard", "-z")
+	}()
+	wg.Wait()
+
 	// Branch & ahead/behind
-	if bOut, err := runGit(root, "status", "--porcelain=v2", "--branch", "-uall"); err == nil {
+	if bErr == nil {
 		parseStatusV2(bOut, snap)
 	}
 
 	// Local branches
-	if brOut, err := runGit(root, "for-each-ref", "--sort=-committerdate", "refs/heads/", "--format=%(refname:short)"); err == nil {
+	if brErr == nil {
 		for _, line := range strings.Split(strings.TrimSpace(brOut), "\n") {
 			if line = strings.TrimSpace(line); line != "" {
 				snap.Branches = append(snap.Branches, line)
@@ -119,7 +183,7 @@ func LoadRepo(dir string) (*RepoSnapshot, error) {
 	}
 
 	// Stashes
-	if stOut, err := runGit(root, "stash", "list", "--format=%gd%x09%gs"); err == nil {
+	if stErr == nil {
 		for _, line := range strings.Split(strings.TrimSpace(stOut), "\n") {
 			if line == "" {
 				continue
@@ -130,9 +194,7 @@ func LoadRepo(dir string) (*RepoSnapshot, error) {
 	}
 
 	// Commits & Graph
-	// shortcut: caps log at 400 commits per load for instant frame times; increase or paginate for deep history
-	if logOut, err := runGit(root, "log", "--all", "--topo-order", "--date=short", "-n", "400",
-		"--pretty=format:%H%x09%P%x09%h%x09%an%x09%ad%x09%D%x09%s"); err == nil {
+	if logErr == nil {
 		for _, line := range strings.Split(strings.TrimSpace(logOut), "\n") {
 			if line == "" {
 				continue
@@ -166,7 +228,11 @@ func LoadRepo(dir string) (*RepoSnapshot, error) {
 		snap.Graph = ComputeGraph(snap.Commits)
 	}
 
-	buildWorkspaceTree(root, snap)
+	if lsErr == nil {
+		buildWorkspaceTreeFromList(lsOut, snap)
+	} else {
+		buildWorkspaceTreeFallback(root, snap)
+	}
 	return snap, nil
 }
 
@@ -254,15 +320,75 @@ func parseStatusV2(out string, snap *RepoSnapshot) {
 
 func ignoredDir(name string) bool {
 	switch name {
-	case ".git", "node_modules", ".mygo", "build", "dist", ".next", "target", "vendor":
+	case ".git", "node_modules", ".mygo", "build", "dist", ".next", "target", "vendor", ".venv", "venv", "__pycache__":
 		return true
 	}
 	return false
 }
 
-func buildWorkspaceTree(root string, snap *RepoSnapshot) {
+func buildWorkspaceTreeFromList(nulOut string, snap *RepoSnapshot) {
+	seenDirs := make(map[string]map[string]bool)
+	var allFiles []string
+	for _, p := range strings.Split(nulOut, "\x00") {
+		p = strings.TrimSuffix(filepath.ToSlash(p), "/")
+		if p == "" {
+			continue
+		}
+		allFiles = append(allFiles, p)
+		cur := p
+		for {
+			parent := filepath.ToSlash(filepath.Dir(cur))
+			if parent == "." || parent == "/" || parent == "" {
+				parent = ""
+			}
+			m := seenDirs[parent]
+			if m == nil {
+				m = make(map[string]bool)
+				seenDirs[parent] = m
+			}
+			m[cur] = true
+			if parent == "" {
+				break
+			}
+			cur = parent
+		}
+	}
+	sort.Strings(allFiles)
+	dedup := allFiles[:0]
+	for i, f := range allFiles {
+		if i == 0 || f != allFiles[i-1] {
+			dedup = append(dedup, f)
+		}
+	}
+	snap.AllFiles = dedup
+
+	for dir, childrenMap := range seenDirs {
+		var dirs, files []string
+		for child := range childrenMap {
+			if _, isDir := seenDirs[child]; isDir {
+				dirs = append(dirs, child)
+			} else {
+				files = append(files, child)
+			}
+		}
+		sort.Strings(dirs)
+		sort.Strings(files)
+		combined := append(dirs, files...)
+		if dir == "" {
+			snap.TreeRoots = combined
+		} else {
+			snap.TreeDirs[dir] = combined
+		}
+	}
+}
+
+func buildWorkspaceTreeFallback(root string, snap *RepoSnapshot) {
+	const maxFallbackFiles = 10000
 	var walk func(relDir string) []string
 	walk = func(relDir string) []string {
+		if len(snap.AllFiles) >= maxFallbackFiles {
+			return nil
+		}
 		absDir := root
 		if relDir != "" {
 			absDir = filepath.Join(root, filepath.FromSlash(relDir))
@@ -273,6 +399,9 @@ func buildWorkspaceTree(root string, snap *RepoSnapshot) {
 		}
 		var dirs, files []string
 		for _, e := range entries {
+			if len(snap.AllFiles) >= maxFallbackFiles {
+				break
+			}
 			name := e.Name()
 			if e.IsDir() {
 				if ignoredDir(name) {
@@ -300,6 +429,22 @@ func buildWorkspaceTree(root string, snap *RepoSnapshot) {
 	}
 	snap.TreeRoots = walk("")
 	sort.Strings(snap.AllFiles)
+}
+
+const maxPreviewBytes = 512 * 1024
+
+func sanitizePreviewText(data []byte) string {
+	probe := data
+	if len(probe) > 8192 {
+		probe = probe[:8192]
+	}
+	if bytes.IndexByte(probe, 0) != -1 {
+		return "// Binary file not shown"
+	}
+	if len(data) > maxPreviewBytes {
+		return string(data[:maxPreviewBytes]) + "\n// … file truncated at 512 KB …\n"
+	}
+	return string(data)
 }
 
 func LoadCommitDetails(root, hash string) (body string, files []CommitFile, err error) {
@@ -335,15 +480,20 @@ func ReadFileAtRef(root, ref, relPath string) string {
 	if err != nil {
 		return ""
 	}
-	return out
+	return sanitizePreviewText([]byte(out))
 }
 
 func ReadWorktreeFile(root, relPath string) string {
-	data, err := os.ReadFile(filepath.Join(root, filepath.FromSlash(relPath)))
+	f, err := os.Open(filepath.Join(root, filepath.FromSlash(relPath)))
 	if err != nil {
 		return ""
 	}
-	return string(data)
+	defer f.Close()
+	data, err := io.ReadAll(io.LimitReader(f, maxPreviewBytes+1))
+	if err != nil {
+		return ""
+	}
+	return sanitizePreviewText(data)
 }
 
 func LoadWorkingDiffTexts(root string, st FileStatus) (oldText, newText string) {
