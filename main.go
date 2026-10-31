@@ -31,6 +31,7 @@ const (
 
 type app struct {
 	paints   perf.PaintTracker
+	cards    commitCards
 	win      *mygo.Window
 	repoDir  string
 	repo     *RepoSnapshot
@@ -1075,8 +1076,7 @@ func (a *app) renderCommitGraphRow(c *ui.Context, t *ui.Theme, cIdx int) {
 	graphW := GraphCellWidth(gRow.MaxCols)
 
 	row := ui.Row(c.Key("cm:"+cm.Hash)).Height(30).Padding(0, 8, 0, 2).Gap(5).
-		Radius(5).Margin(0, 4).AlignItems(ui.Center).Clip().Cursor(ui.CursorPointer).
-		Tooltip(cm.ShortHash + " · " + cm.Subject)
+		Radius(5).Margin(0, 4).AlignItems(ui.Center).Clip().Cursor(ui.CursorPointer)
 	hovered := row.Hovered()
 	pressed := row.Pressed()
 
@@ -1143,6 +1143,8 @@ func (a *app) renderCommitGraphRow(c *ui.Context, t *ui.Theme, cIdx int) {
 			hashTxt.TextColor(hashTxt.AnimateColor("hc", hashColTarget, microColorAnim))
 		}
 	})
+
+	a.commitCard(c, t, row, cm)
 
 	if row.Clicked() {
 		a.toggleCommit(cIdx)
@@ -1525,6 +1527,12 @@ func main() {
 		startDir = os.Args[1]
 	}
 	a := newApp(startDir)
+	a.useUserServices()
+	mygo.App.SetMenu(newAppMenu(a.cards.settings, func() {
+		if a.win != nil {
+			a.win.Invalidate()
+		}
+	}))
 
 	mygo.App.WhenReady(func() {
 		a.win = mygo.NewWindow(mygo.WindowOptions{
