@@ -36,6 +36,7 @@ type app struct {
 	repo     *RepoSnapshot
 	repoErr  string
 	busyText string
+	live     liveState
 
 	// Global UI state
 	activeMode    int // 0 = Files, 1 = Git
@@ -43,7 +44,6 @@ type app struct {
 	newBranchOpen bool
 	newBranchName string
 	contentSeq    uint64
-	loadSeq       uint64
 
 	// Mode 0: Files (Explorer) state
 	openDirs      map[string]bool
@@ -172,27 +172,7 @@ func (a *app) refreshRepo() {
 }
 
 func (a *app) reloadRepoAsync(dir string) {
-	if dir != "" {
-		a.repoDir = dir
-	}
-	if a.win == nil {
-		a.refreshRepo()
-		return
-	}
-	a.loadSeq++
-	seq := a.loadSeq
-	targetDir := a.repoDir
-	a.busyText = "Loading…"
-	go func() {
-		snap, err := LoadRepo(targetDir)
-		a.win.Update(func() {
-			if a.loadSeq != seq {
-				return
-			}
-			a.busyText = ""
-			a.applyRepoSnapshot(snap, err)
-		})
-	}()
+	a.reload(dir) // live.go: queued with the other Git work
 }
 
 func isPreferredSourceFile(p string) bool {
@@ -235,7 +215,7 @@ func (a *app) applyRepoSnapshot(snap *RepoSnapshot, err error) {
 		}
 		a.selectExplorerFile(pick)
 	} else if a.selectedFile != "" {
-		a.selectExplorerFile(a.selectedFile)
+		a.reselectExplorerFile(snap) // opens another file if this one is gone
 	}
 
 	// Ensure a diff target is ready in Git mode
@@ -277,33 +257,6 @@ func (a *app) applyRepoSnapshot(snap *RepoSnapshot, err error) {
 			}
 		}
 	}
-}
-
-func (a *app) runAsyncGit(label string, fn func(root string) error) {
-	if a.repo == nil {
-		return
-	}
-	root := a.repo.Root
-	a.busyText = label
-	if a.win == nil {
-		_ = fn(root)
-		a.busyText = ""
-		a.refreshRepo()
-		return
-	}
-	a.loadSeq++
-	seq := a.loadSeq
-	go func() {
-		_ = fn(root)
-		snap, err := LoadRepo(root)
-		a.win.Update(func() {
-			if a.loadSeq != seq {
-				return
-			}
-			a.busyText = ""
-			a.applyRepoSnapshot(snap, err)
-		})
-	}()
 }
 
 func (a *app) selectExplorerFile(relPath string) {
@@ -488,6 +441,7 @@ func (a *app) view(c *ui.Context) {
 	a.sidebarW = min(max(a.sidebarW, 252), 540)
 
 	a.modalsView(c, t)
+	a.liveView(c)
 }
 
 // ============================================================================
@@ -523,7 +477,7 @@ func (a *app) sidebarView(c *ui.Context, t *ui.Theme) {
 			if a.busyText != "" {
 				ui.Spinner(c).Label(a.busyText)
 			}
-			if iconBtn(c, "btn-refresh", IconRefresh, "Refresh (⌘R)", a.busyText != "") {
+			if iconBtnState(c, "btn-refresh", IconRefresh, "Refresh (⌘R)", a.busyText != "", a.writeBusy()) {
 				a.reloadRepoAsync(a.repoDir)
 			}
 		})
@@ -562,9 +516,7 @@ func (a *app) sidebarView(c *ui.Context, t *ui.Theme) {
 					}
 					if m.Item(br).Radio(br == a.repo.Branch).Chosen() && br != a.repo.Branch {
 						target := br
-						a.runAsyncGit("Checkout "+target, func(root string) error {
-							return GitCheckoutBranch(root, target, false)
-						})
+						a.checkoutBranch(target, false)
 					}
 				}
 				if !shownCurrent && a.repo.Branch != "" {
@@ -829,7 +781,7 @@ func (a *app) gitSidebarBody(c *ui.Context, t *ui.Theme) {
 			msg := strings.TrimSpace(a.commitMsg)
 			needStage := len(a.repo.Staged) == 0 && len(a.repo.Unstaged) > 0
 			a.commitMsg = ""
-			a.runAsyncGit("Commit", func(root string) error {
+			a.runGitOp(perf.OpCommit, "Commit", func(root string) error {
 				if needStage {
 					if err := GitStageAll(root); err != nil {
 						return err
@@ -915,13 +867,13 @@ func (a *app) renderChangesSectionHeader(c *ui.Context, t *ui.Theme, count int) 
 		if len(a.repo.Staged) > 0 {
 			if rowActionBtn(c, "unstage-all", IconMinus, "Unstage All", actionToneWarning) {
 				actionClicked = true
-				a.runAsyncGit("Unstage All", GitUnstageAll)
+				a.runGitOp(perf.OpStage, "Unstage All", GitUnstageAll)
 			}
 		}
 		if len(a.repo.Unstaged) > 0 {
 			if rowActionBtn(c, "stage-all", IconPlus, "Stage All", actionToneSuccess) {
 				actionClicked = true
-				a.runAsyncGit("Stage All", GitStageAll)
+				a.runGitOp(perf.OpStage, "Stage All", GitStageAll)
 			}
 		}
 	})
@@ -1018,7 +970,7 @@ func (a *app) renderWorkingFileRow(c *ui.Context, t *ui.Theme, st FileStatus) {
 					if rowActionBtn(c, "unstage:"+st.Path, IconMinus, "Unstage", actionToneWarning) {
 						actionClicked = true
 						p := st.Path
-						a.runAsyncGit("Unstage", func(root string) error { return GitUnstageFile(root, p) })
+						a.runGitOp(perf.OpStage, "Unstage", func(root string) error { return GitUnstageFile(root, p) })
 					}
 				} else {
 					if rowActionBtn(c, "discard:"+st.Path, IconUndo, "Discard changes", actionToneDanger) {
@@ -1029,7 +981,7 @@ func (a *app) renderWorkingFileRow(c *ui.Context, t *ui.Theme, st FileStatus) {
 					if rowActionBtn(c, "stage:"+st.Path, IconPlus, "Stage", actionToneSuccess) {
 						actionClicked = true
 						p := st.Path
-						a.runAsyncGit("Stage", func(root string) error { return GitStageFile(root, p) })
+						a.runGitOp(perf.OpStage, "Stage", func(root string) error { return GitStageFile(root, p) })
 					}
 				}
 			})
@@ -1380,11 +1332,11 @@ func (a *app) gitMainPane(c *ui.Context, t *ui.Theme) {
 			st := *a.diffFileStat
 			if st.Staged {
 				if ghostBtn(c, "diff-unstage", IconMinus, "Unstage", "Unstage this file", false) {
-					a.runAsyncGit("Unstage", func(root string) error { return GitUnstageFile(root, st.Path) })
+					a.runGitOp(perf.OpStage, "Unstage", func(root string) error { return GitUnstageFile(root, st.Path) })
 				}
 			} else {
 				if ghostBtn(c, "diff-stage", IconPlus, "Stage", "Stage this file", false) {
-					a.runAsyncGit("Stage", func(root string) error { return GitStageFile(root, st.Path) })
+					a.runGitOp(perf.OpStage, "Stage", func(root string) error { return GitStageFile(root, st.Path) })
 				}
 			}
 			if ghostBtn(c, "diff-open-file", IconFiles, "File", "Read full file in Explorer", false) {
@@ -1488,9 +1440,7 @@ func (a *app) modalsView(c *ui.Context, t *ui.Theme) {
 				name := strings.TrimSpace(a.newBranchName)
 				if (primaryActionBtn(c, "create-branch", IconCheck, "Create", name == "") || sub) && name != "" {
 					a.newBranchOpen = false
-					a.runAsyncGit("Create branch "+name, func(root string) error {
-						return GitCheckoutBranch(root, name, true)
-					})
+					a.checkoutBranch(name, true)
 				}
 			})
 		})
@@ -1539,6 +1489,7 @@ func main() {
 			Vibrancy:       mygo.VibrancySidebar,
 			Content:        ui.View(a.view),
 		})
+		a.attachWindow()
 	})
 	if err := mygo.App.Run(); err != nil {
 		log.Fatal(err)

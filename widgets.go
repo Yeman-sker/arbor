@@ -131,12 +131,21 @@ func renderSegTab(c *ui.Context, key string, ic *ui.SVG, label string, badge int
 
 // iconBtn renders a 25x25 borderless Linear-style icon button with contextual icon micro-animations.
 func iconBtn(c *ui.Context, key string, ic *ui.SVG, tip string, active bool) bool {
+	return iconBtnState(c, key, ic, tip, active, false)
+}
+
+// iconBtnState is iconBtn that can also be disabled: dimmed, without hover or
+// press feedback, and never clicked.
+func iconBtnState(c *ui.Context, key string, ic *ui.SVG, tip string, active, disabled bool) bool {
 	t := c.Theme()
 	btn := ui.ButtonBase(c.Key(key)).Size(25, 25).Radius(5).Shrink(0).Center().
-		Cursor(ui.CursorPointer).Label(tip).Tooltip(tip)
+		Cursor(ui.CursorPointer).Label(tip).Tooltip(tip).Disabled(disabled)
+	if disabled {
+		btn.Opacity(0.4)
+	}
 
-	hovered := btn.Hovered()
-	pressed := btn.Pressed()
+	hovered := btn.Hovered() && !disabled
+	pressed := btn.Pressed() && !disabled
 
 	targetBg := t.Surface.Alpha(0)
 	targetFg := t.TextMuted
@@ -197,7 +206,7 @@ func iconBtn(c *ui.Context, key string, ic *ui.SVG, tip string, active bool) boo
 	btn.Children(func() {
 		ui.Icon(c, ic).Size(14, 14).AnimatePose(icPose, snappyPoseAnim)
 	})
-	return btn.Clicked()
+	return !disabled && btn.Clicked()
 }
 
 // rowIconBtn renders a default-tone 20x20 icon button inside a list row.
