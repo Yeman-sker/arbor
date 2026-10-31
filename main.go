@@ -1579,6 +1579,9 @@ func (a *app) repoFailed(dir string) {
 }
 
 func main() {
+	diag := newDiagnostics(sharedSettings(), userDataPath(), mygo.App.Version(), nativePrompts{})
+	diag.newWindow = newPerfHostWindow
+	diag.Start()
 	beginStartup()
 	startDir := ""
 	if len(os.Args) > 1 {
@@ -1595,14 +1598,21 @@ func main() {
 	reg.changed = func() { mygo.App.Dock.SetMenu(reg.dockMenu()) }
 	reg.quitsWithLastWindow = runtime.GOOS != "darwin"
 
-	mygo.App.SetMenu(newAppMenu(sharedSettings(), func() {
-		for _, w := range mygo.Windows() {
-			w.Invalidate()
-		}
-	}, reg.fileMenuItems()...))
+	installMenu := func() {
+		mygo.App.SetMenu(newAppMenuWith(sharedSettings(), func() {
+			for _, w := range mygo.Windows() {
+				w.Invalidate()
+			}
+		}, reg.fileMenuItems(), diag.menuItems()))
+	}
+	diag.menuChanged = installMenu
+	installMenu()
 	mygo.App.Dock.SetMenu(reg.dockMenu())
 	mygo.App.OnBeforeQuit(func(*mygo.QuitEvent) { reg.BeginQuit() })
-	mygo.App.OnQuit(reg.Flush)
+	mygo.App.OnQuit(func() {
+		reg.Flush()
+		diag.Close()
+	})
 	mygo.App.OnActivate(reg.Activated)
 	// With its last window closed, the application stays in the Dock on macOS,
 	// as Mac applications do, and opens a window when it is activated; it

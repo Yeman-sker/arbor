@@ -40,6 +40,8 @@ var (
 	IconExpand      = mustLucide(`<path d="m7 15 5 5 5-5"/><path d="m7 9 5-5 5 5"/>`)
 	IconChevronUp   = mustLucide(`<path d="m18 15-6-6-6 6"/>`)
 	IconChevronDown = mustLucide(`<path d="m6 9 6 6 6-6"/>`)
+	IconChevronLeft  = mustLucide(`<path d="m15 18-6-6 6-6"/>`)
+	IconDownload     = mustLucide(`<path d="M12 15V3"/><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><path d="m7 10 5 5 5-5"/>`)
 	IconChevronRight = mustLucide(`<path d="m9 18 6-6-6-6"/>`)
 	IconArrowDown   = mustLucide(`<path d="M12 5v14"/><path d="m19 12-7 7-7-7"/>`)
 	IconArrowUp     = mustLucide(`<path d="m5 12 7-7 7 7"/><path d="M12 19V5"/>`)

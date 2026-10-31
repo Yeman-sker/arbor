@@ -54,6 +54,9 @@ type App struct {
 }
 
 // Launch starts the binary on a repository and waits for its window.
+// extraEnv is added to the environment of the next launched apps.
+var extraEnv []string
+
 func Launch(bin, repo string) (*App, error) {
 	dir, err := os.MkdirTemp("", "ae")
 	if err != nil {
@@ -62,7 +65,7 @@ func Launch(bin, repo string) (*App, error) {
 	a := &App{dir: dir, logPath: filepath.Join(dir, "spans.jsonl"), done: make(chan struct{})}
 	sock := filepath.Join(dir, "s.sock")
 	a.cmd = exec.Command(bin, repo)
-	a.cmd.Env = append(os.Environ(), "MYGO_AUTOMATION="+sock, "ARBOR_PERF_LOG="+a.logPath, "MYGO_FRAME_STATS=all")
+	a.cmd.Env = append(append(os.Environ(), "MYGO_AUTOMATION="+sock, "ARBOR_PERF_LOG="+a.logPath, "MYGO_FRAME_STATS=all"), extraEnv...)
 	stderr, err := a.cmd.StderrPipe()
 	if err != nil {
 		return nil, err

@@ -17,6 +17,9 @@ type Settings struct {
 	// repositories whose origin is on GitHub. Off, nothing is fetched and
 	// the cards show initials.
 	GitHubAvatars bool `json:"githubAvatars"`
+	// PerformanceDiagnostics records how long operations take, on this computer
+	// only, and shows the Performance window. It stays off until the user allows it.
+	PerformanceDiagnostics bool `json:"performanceDiagnostics"`
 }
 
 func defaultSettings() Settings {
@@ -135,23 +138,30 @@ func sharedSettings() *settingsStore {
 // fileItems, when there are any, are the items of the File menu in place of
 // the standard one's.
 func newAppMenu(settings *settingsStore, changed func(), fileItems ...*mygo.MenuItem) *mygo.Menu {
+	return newAppMenuWith(settings, changed, fileItems, nil)
+}
+
+// newAppMenuWith is newAppMenu with viewItems added at the end of the View menu.
+func newAppMenuWith(settings *settingsStore, changed func(), fileItems, viewItems []*mygo.MenuItem) *mygo.Menu {
+	view := []*mygo.MenuItem{
+		{Role: mygo.RoleReload},
+		{Role: mygo.RoleForceReload},
+		{Role: mygo.RoleToggleDevTools},
+		mygo.Separator(),
+		{Role: mygo.RoleResetZoom},
+		{Role: mygo.RoleZoomIn},
+		{Role: mygo.RoleZoomOut},
+		mygo.Separator(),
+		{Role: mygo.RoleToggleFullScreen},
+		mygo.Separator(),
+		githubAvatarsMenuItem(settings, changed),
+	}
+	view = append(view, viewItems...)
 	return mygo.NewMenu([]*mygo.MenuItem{
 		{Role: mygo.RoleAppMenu},
 		{Role: mygo.RoleFileMenu, Submenu: fileItems},
 		{Role: mygo.RoleEditMenu},
-		{Role: mygo.RoleViewMenu, Submenu: []*mygo.MenuItem{
-			{Role: mygo.RoleReload},
-			{Role: mygo.RoleForceReload},
-			{Role: mygo.RoleToggleDevTools},
-			mygo.Separator(),
-			{Role: mygo.RoleResetZoom},
-			{Role: mygo.RoleZoomIn},
-			{Role: mygo.RoleZoomOut},
-			mygo.Separator(),
-			{Role: mygo.RoleToggleFullScreen},
-			mygo.Separator(),
-			githubAvatarsMenuItem(settings, changed),
-		}},
+		{Role: mygo.RoleViewMenu, Submenu: view},
 		{Role: mygo.RoleWindowMenu},
 	})
 }

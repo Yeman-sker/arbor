@@ -2,7 +2,9 @@ package main
 
 import (
 	"arbor/internal/fixture"
+	"arbor/internal/perfstore"
 	"arbor/perf"
+	"bytes"
 	"fmt"
 	"os"
 	"os/exec"
@@ -50,6 +52,7 @@ var scenarios = []Scenario{
 	{"idle", "a settled window: frames drawn and CPU used", scenarioIdle},
 	{"memory", "resident memory after startup and after use (a baseline, no budget)", scenarioMemory},
 	{"new_window", "open a second window", scenarioNewWindow},
+	{"diagnostics", "diagnostics on: the real store and Performance window", scenarioDiagnostics},
 }
 
 // ---------------------------------------------------------------------------
@@ -697,4 +700,78 @@ func scenarioNewWindow(e *Env) ([]Metric, error) {
 		}
 		return []Metric{spanMetric("new_window", s, perf.OpNewWindow, ms, "New Window chosen until the new window's first paint")}, nil
 	})
+}
+
+// scenarioDiagnostics runs the app with diagnostics on in a home of its own: the
+// real store writes while the app is used, and the real Performance window opens
+// from the menu. It fails when user data reaches the log.
+func scenarioDiagnostics(e *Env) ([]Metric, error) {
+	s := e.Sizes[0]
+	home, err := os.MkdirTemp(e.Tmp, "home-")
+	if err != nil {
+		return nil, err
+	}
+	// An app that isn't packaged keeps its data under the name of its binary.
+	data := filepath.Join(home, "Library", "Application Support", filepath.Base(e.Bin))
+	if err := os.MkdirAll(data, 0o755); err != nil {
+		return nil, err
+	}
+	if err := os.WriteFile(filepath.Join(data, "settings.json"), []byte(`{"githubAvatars":false,"performanceDiagnostics":true}`), 0o644); err != nil {
+		return nil, err
+	}
+	// With no span log the app's only sink is the one diagnostics installs.
+	extraEnv = []string{"HOME=" + home, "ARBOR_PERF_LOG="}
+	defer func() { extraEnv = nil }()
+	dir, err := e.RepoOf(s, dirtyCopy)
+	if err != nil {
+		return nil, err
+	}
+	a, err := Launch(e.Bin, dir)
+	if err != nil {
+		return nil, err
+	}
+	defer a.Stop()
+	if err := a.clickKey("seg-git"); err != nil {
+		return nil, err
+	}
+	if err := a.Client.Call("menu", map[string]any{"path": []string{"View", "Performance Window"}}, nil); err != nil {
+		return nil, fmt.Errorf("the Performance window is not in the menu: %w", err)
+	}
+	opened := false
+	for deadline := time.Now().Add(5 * time.Second); time.Now().Before(deadline) && !opened; time.Sleep(50 * time.Millisecond) {
+		var res struct {
+			Windows []struct {
+				ID    int
+				Title string
+			}
+		}
+		if err := a.Client.Call("windows", nil, &res); err != nil {
+			return nil, err
+		}
+		opened = len(res.Windows) >= 2
+	}
+	if !opened {
+		return nil, fmt.Errorf("the Performance window did not open")
+	}
+	var logs []byte
+	logDir := perfstore.LogDir(data)
+	for deadline := time.Now().Add(5 * time.Second); time.Now().Before(deadline) && !bytes.Contains(logs, []byte(`"op":"mode_switch"`)); time.Sleep(100 * time.Millisecond) {
+		logs = nil
+		files, _ := filepath.Glob(filepath.Join(logDir, "*.jsonl"))
+		for _, f := range files {
+			b, err := os.ReadFile(f)
+			if err != nil {
+				return nil, err
+			}
+			logs = append(logs, b...)
+		}
+	}
+	if !bytes.Contains(logs, []byte(`"op":"mode_switch"`)) {
+		return nil, fmt.Errorf("the store wrote no mode_switch to %s: %q", logDir, logs)
+	}
+	if bytes.Contains(logs, []byte(filepath.Base(dir))) || bytes.Contains(logs, []byte(home)) {
+		return nil, fmt.Errorf("a path reached the log: %q", logs)
+	}
+	return []Metric{{Scenario: "diagnostics", Size: s.Name, Unit: "lines", Samples: []float64{float64(bytes.Count(logs, []byte("\n")))},
+		Note: "real store and Performance window, in a home of their own"}}, nil
 }
