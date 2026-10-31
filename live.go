@@ -134,6 +134,9 @@ func (a *app) publisher() func(func()) {
 // goLoad runs work off the UI thread and then the function it returns on it.
 // Without a window both run right here.
 func (a *app) goLoad(work func() func()) {
+	if a.closed {
+		return
+	}
 	if a.live.post == nil {
 		if apply := work(); apply != nil {
 			apply()
@@ -190,7 +193,7 @@ func (a *app) runAsyncGit(label string, fn func(root string) error) {
 
 // runGitOp is runAsyncGit for an operation that is measured as op.
 func (a *app) runGitOp(op perf.Op, label string, fn func(root string) error) {
-	if a.repo == nil {
+	if a.repo == nil || a.closed {
 		return
 	}
 	root := a.repo.Root
@@ -269,6 +272,9 @@ func (a *app) stashAndSwitch(branch string) {
 // for while an operation changes the repository is dropped: the operation
 // reads the repository when it is done.
 func (a *app) reload(dir string) {
+	if a.closed || (dir == "" && a.repoDir == "") {
+		return // closed, or with nothing to read again
+	}
 	switching := dir != "" && dir != a.repoDir
 	if switching {
 		a.endSession()
@@ -287,6 +293,9 @@ func (a *app) reload(dir string) {
 
 // requestRefresh queues a refresh of the repository.
 func (a *app) requestRefresh(req refreshReq) {
+	if a.closed {
+		return
+	}
 	if req.dir == "" {
 		req.dir = a.repoDir
 	}
@@ -367,14 +376,18 @@ func (a *app) finishRefresh(req refreshReq, span perf.Span, snap *RepoSnapshot, 
 // leaves an empty window that says why.
 func (a *app) applyLoaded(req refreshReq, snap *RepoSnapshot, err error) {
 	if err == nil {
+		a.loading = ""
 		a.applyRepoSnapshot(snap, nil)
 		a.live.lastFull = time.Now()
 		a.ensureWatch()
+		a.repoShown()
 		return
 	}
 	switch {
 	case req.switching || a.repo == nil:
+		a.loading = ""
 		a.applyRepoSnapshot(nil, err)
+		a.repoFailed(req.dir)
 	case req.manual:
 		a.toastGitError("Refresh", err)
 	}
@@ -405,13 +418,21 @@ func (a *app) reportGitError(label string, err error) {
 		a.live.ask = &switchAsk{branch: lc.Branch, files: lc.Files}
 		a.live.askOpen = true
 	case errors.As(err, &wb):
-		a.live.toasts = append(a.live.toasts, ui.Toast{
+		toast := ui.Toast{
 			ID:          "git-error:" + label,
 			Title:       "Can't switch to " + wb.Branch,
 			Description: "It is checked out in another worktree: " + wb.Path,
 			Type:        "error",
 			Timeout:     errorToastLife,
-		})
+		}
+		if a.reg != nil {
+			// The way forward is that worktree, in a window of its own, or the
+			// one that shows it already.
+			path := wb.Path
+			toast.Action = "Open in New Window"
+			toast.OnAction = func() { a.requestOpen(path, true) }
+		}
+		a.live.toasts = append(a.live.toasts, toast)
 	default:
 		a.toastGitError(label, err)
 	}

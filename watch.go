@@ -80,10 +80,30 @@ func (a *app) stopWatch() {
 func (a *app) attachWindow() {
 	a.endSession()
 	a.live.post = a.win.Update
-	a.live.lastFull = time.Now() // newApp has just read the repository
+	if a.repo != nil {
+		a.live.lastFull = time.Now() // newApp has just read the repository
+	}
 	a.win.OnFocus(a.onFocus)
-	a.win.OnClosed(a.endSession)
+	a.win.OnClosed(a.windowClosed)
 	a.ensureWatch()
+}
+
+// windowClosed is the window going away. Everything that runs for it stops:
+// the watchers, the queued Git work, the loads and the jobs of the commit
+// cards; what is already on its way back through Window.Update finds the app
+// closed and is dropped, as Update runs it whether the window is there or not.
+func (a *app) windowClosed() {
+	if a.closed {
+		return
+	}
+	a.closed = true
+	a.endSession()
+	a.cards.stop()
+	a.pending = nil
+	a.branchPick.open, a.repoPick.open = false, false
+	if a.reg != nil {
+		a.reg.windowClosed(a)
+	}
 }
 
 // ensureWatch watches the repository on screen, unless it already does. It

@@ -3,6 +3,7 @@ package main
 import (
 	"arbor/perf"
 	"fmt"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -71,6 +72,9 @@ type pickerSpec struct {
 	// Choose is called, after the picker closed, with the row clicked or
 	// highlighted when Enter was pressed.
 	Choose func(row pickerRow)
+	// ChooseNew, when set, is called in its place for a row chosen with Shift
+	// or Alt held: clicked so, or Shift+Enter.
+	ChooseNew func(row pickerRow)
 	// Actions are the rows under the list, for the text in the search field
 	// and whether a row's label is exactly that text.
 	Actions func(query string, exact bool) []pickerAction
@@ -96,6 +100,8 @@ type picker struct {
 	// frame is built, with the rows that the text then in the field leaves.
 	moves int
 	enter bool
+	// alt tells that Enter came with Shift.
+	alt bool
 
 	wasOpen bool
 	built   bool
@@ -128,6 +134,10 @@ func (p *picker) reset() {
 // onKey is the search field's OnTextKey. It only records: the frame that
 // follows applies it to the rows as they then are.
 func (p *picker) onKey(k ui.TextKey) bool {
+	if k.Mods == ui.Shift && k.Key == ui.KeyEnter {
+		p.enter, p.alt = true, true
+		return true
+	}
 	if k.Mods != 0 {
 		return false
 	}
@@ -240,7 +250,7 @@ func (p *picker) panel(c *ui.Context, t *ui.Theme, panel ui.Element, spec picker
 			Exit:     &ui.Motion{Opacity: 0, Y: -4},
 		})
 
-	picked := -1
+	picked, alt := -1, false
 	ui.Row(c).Height(pickerSearchH).Shrink(0).Padding(0, 12).Gap(8).AlignItems(ui.Center).
 		BorderWidth(0, 0, 1, 0).BorderColor(t.Border).Children(func() {
 		ui.Icon(c, IconSearch).Size(14, 14).Shrink(0).TextColor(t.TextMuted)
@@ -258,7 +268,7 @@ func (p *picker) panel(c *ui.Context, t *ui.Theme, panel ui.Element, spec picker
 		p.fade.Wrap(c, t, func() scrollMark {
 			ui.List(c, &p.list, n, func(i int) {
 				if p.rowView(c, t, i, p.rows[p.matches[i]]) {
-					picked = i
+					picked, alt = i, c.Modifiers()&(ui.Shift|ui.Alt) != 0
 				}
 			}).Grow(1).MinHeight(0).Padding(pickerListPad, 4)
 			first, last := p.list.Visible()
@@ -284,15 +294,19 @@ func (p *picker) panel(c *ui.Context, t *ui.Theme, panel ui.Element, spec picker
 	if p.enter {
 		p.enter = false
 		if total > 0 {
-			picked = p.hi
+			picked, alt = p.hi, p.alt
 		}
+		p.alt = false
 	}
 	switch {
 	case picked < 0:
 	case picked < n:
 		row := p.rows[p.matches[picked]]
 		p.open = false
-		if spec.Choose != nil {
+		switch {
+		case alt && spec.ChooseNew != nil:
+			spec.ChooseNew(row)
+		case spec.Choose != nil:
 			spec.Choose(row)
 		}
 	case picked-n < len(actions):
@@ -514,6 +528,60 @@ func branchRows(repo *RepoSnapshot, now time.Time) []pickerRow {
 		rows[0] = current
 	}
 	return rows
+}
+
+// ============================================================================
+// The repository menu
+// ============================================================================
+
+// repoMenuSource says what the rows of the repository menu were read from.
+type repoMenuSource struct {
+	repo *RepoSnapshot
+	rev  uint64
+}
+
+// repoPicker shows the repository menu under anchor, the repository button:
+// the repository on show and the recent ones, then Open… and Open in New
+// Window…. A repository is chosen to show it in this window, or with Shift or
+// Alt held, in a window of its own; one that a window shows already is
+// brought to the front instead, either way.
+func (a *app) repoPicker(c *ui.Context, t *ui.Theme, anchor ui.Element) {
+	repo, reg := a.repo, a.reg
+	src := repoMenuSource{repo: repo}
+	if reg != nil {
+		src.rev = reg.rev
+	}
+	a.repoPick.view(c, t, anchor, pickerSpec{
+		Key:         "repo",
+		Placeholder: "Search repositories…",
+		Empty:       "No repositories match",
+		Source:      src,
+		Build: func() []pickerRow {
+			if reg != nil {
+				return reg.repoRows(a)
+			}
+			return []pickerRow{{Key: repo.Root, Label: repoName(repo.Root), Hint: tildePath(filepath.Dir(repo.Root)), Current: true}}
+		},
+		Choose: func(r pickerRow) {
+			if !r.Current {
+				a.requestOpen(r.Key, false)
+			}
+		},
+		ChooseNew: func(r pickerRow) {
+			if !r.Current {
+				a.requestOpen(r.Key, true)
+			}
+		},
+		Actions: func(string, bool) []pickerAction {
+			if reg == nil {
+				return nil
+			}
+			return []pickerAction{
+				{Key: "open", Label: "Open…", Icon: IconFolderOpen, Do: func() { a.openRepoDialog(false) }},
+				{Key: "open-new", Label: "Open in New Window…", Icon: IconFolderOpen, Do: func() { a.openRepoDialog(true) }},
+			}
+		},
+	})
 }
 
 // openNewBranch opens the dialog that creates a branch, with name in it.

@@ -6,6 +6,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"time"
 
@@ -32,12 +33,25 @@ const (
 type app struct {
 	paints   perf.PaintTracker
 	cards    commitCards
-	win      *mygo.Window
+	win      hostWindow // nil until the window exists, and in tests
 	repoDir  string
 	repo     *RepoSnapshot
 	repoErr  string
 	busyText string
 	live     liveState
+
+	// The window: its registry and slot (nil and 0 outside one), whether it
+	// has closed, the repository it is opening, and what it last told the
+	// registry and the window system about the repository it shows.
+	reg      *windowRegistry
+	slot     int
+	closed   bool
+	loading  string
+	recorded string
+	title    string
+	// pending is what later queued for the next frame.
+	pending  []func()
+	repoPick picker
 
 	// Global UI state
 	activeMode    int // 0 = Files, 1 = Git
@@ -80,6 +94,9 @@ type app struct {
 	diffExpandAll bool
 }
 
+// newApp makes an app showing the repository at initialDir (where the process
+// is, for ""), which it has read when it returns. Windows do not wait so: see
+// newBareApp.
 func newApp(initialDir string) *app {
 	if initialDir == "" {
 		if wd, err := os.Getwd(); err == nil {
@@ -88,6 +105,15 @@ func newApp(initialDir string) *app {
 			initialDir = "."
 		}
 	}
+	a := newBareApp(initialDir)
+	a.refreshRepo()
+	return a
+}
+
+// newBareApp makes an app that has read nothing: it shows no repository until
+// openRepo or reload loads one in the background. dir is the repository it
+// means to show, "" for none.
+func newBareApp(initialDir string) *app {
 	codeBuf := editor.NewBuffer("")
 	oldBuf := editor.NewBuffer("")
 	newBuf := editor.NewBuffer("")
@@ -165,7 +191,6 @@ func newApp(initialDir string) *app {
 			},
 		},
 	}
-	a.refreshRepo()
 	return a
 }
 
@@ -190,7 +215,7 @@ func isPreferredSourceFile(p string) bool {
 func (a *app) applyRepoSnapshot(snap *RepoSnapshot, err error) {
 	if err != nil {
 		a.repo = nil
-		a.repoErr = err.Error()
+		a.repoErr = gitMessage(err)
 		return
 	}
 	a.repo = snap
@@ -378,6 +403,7 @@ func statusColor(t *ui.Theme, badge string) ui.Color {
 }
 
 func (a *app) view(c *ui.Context) {
+	a.runPending() // before anything reads what it may change
 	t := applyLinearTheme(c)
 	if c.Vibrancy() {
 		c.Root().Background(ui.Transparent)
@@ -458,9 +484,13 @@ func (a *app) sidebarView(c *ui.Context, t *ui.Theme) {
 
 		if a.repo == nil {
 			ui.Column(c).Grow(1).Center().Padding(16).Gap(10).Children(func() {
-				ui.Text(c, "No Git repository").TextColor(t.TextMuted)
-				if primaryActionBtn(c, "open-repo-empty", IconFolder, "Open Folder…", false) {
-					a.openRepoDialog()
+				if a.loading != "" {
+					ui.Text(c, "Opening "+repoName(a.loading)+"…").TextColor(t.TextMuted).SingleLine()
+					return
+				}
+				ui.Text(c, "No repository open").TextColor(t.TextMuted)
+				if primaryActionBtn(c, "open-repo-empty", IconFolder, "Open…", false) {
+					a.openRepoDialog(false)
 				}
 			})
 			return
@@ -470,10 +500,11 @@ func (a *app) sidebarView(c *ui.Context, t *ui.Theme) {
 		ui.Row(c).Height(34).FillWidth().Padding(0, 8).Gap(4).AlignItems(ui.Center).
 			BorderWidth(0, 0, 1, 0).BorderColor(t.Border).Clip().Children(func() {
 
-			repoName := filepath.Base(a.repo.Root)
-			if ghostBtn(c, "btn-repo", IconFolder, repoName, a.repo.Root+" (Click to switch repository)", false) {
-				a.openRepoDialog()
+			repoBtn, repoClicked := ghostDropdownBtn(c, "btn-repo", IconFolder, repoName(a.repo.Root), a.repo.Root+" (Click to switch repository)", 0)
+			if repoClicked {
+				a.repoPick.open = !a.repoPick.open
 			}
+			a.repoPicker(c, t, repoBtn)
 
 			branchBtn, branchClicked := ghostDropdownBtn(c, "btn-branch", IconGitBranch, a.repo.Branch, "Switch or create branch ("+a.repo.Branch+")", 112)
 			if branchClicked {
@@ -1364,15 +1395,66 @@ func (a *app) gitMainPane(c *ui.Context, t *ui.Theme) {
 	})
 }
 
+// emptyRepoView is the pane of a window with no repository: the one it is
+// opening, or why the last one did not open, and the recent ones to open.
 func (a *app) emptyRepoView(c *ui.Context, t *ui.Theme) {
+	bar := c.TitleBar()
+	// A title bar to drag the window by, as the panes with a repository have.
+	ui.Row(c).Height(headerHeight).FillWidth().Shrink(0).Padding(0, max(bar.Right+12, 14), 0, 14).
+		Background(t.Surface).BorderWidth(0, 0, 1, 0).BorderColor(t.Border).DragWindow().Children(func() {})
+
 	ui.Column(c).Grow(1).FillWidth().Center().Gap(12).Padding(32).Children(func() {
-		ui.Icon(c, IconGitBranch).Size(32, 32).TextColor(t.TextMuted)
-		ui.Text(c, "No Git Repository Loaded").FontSize(16).Bold()
-		if a.repoErr != "" {
-			ui.Text(c, a.repoErr).TextColor(t.TextMuted)
+		if a.loading != "" {
+			ui.Spinner(c)
+			ui.Text(c, "Opening "+repoName(a.loading)+"…").FontSize(16).Bold().SingleLine()
+			ui.Text(c, tildePath(a.loading)).FontSize(12).TextColor(t.TextMuted).SingleLine()
+			return
 		}
-		if primaryActionBtn(c, "open-repo-main", IconFolder, "Open Repository Folder…", false) {
-			a.openRepoDialog()
+		ui.Icon(c, IconGitBranch).Size(32, 32).TextColor(t.TextMuted)
+		if a.repoErr != "" {
+			ui.Text(c, "No Git Repository Loaded").FontSize(16).Bold()
+			ui.Text(c, a.repoErr).TextColor(t.TextMuted).MaxWidth(420).MaxLines(4)
+		} else {
+			ui.Text(c, "Open a repository").FontSize(16).Bold()
+		}
+		if primaryActionBtn(c, "open-repo-main", IconFolder, "Open Repository…", false) {
+			a.openRepoDialog(false)
+		}
+		a.recentRepos(c, t)
+	})
+}
+
+// recentRepos lists the recent repositories under the empty window's button.
+func (a *app) recentRepos(c *ui.Context, t *ui.Theme) {
+	if a.reg == nil {
+		return
+	}
+	recents := a.reg.Recents()
+	if len(recents) == 0 {
+		return
+	}
+	ui.Column(c).Width(400).Gap(2).Margin(14, 0, 0, 0).Children(func() {
+		ui.Text(c, "RECENT").FontSize(11).Bold().TextColor(t.TextMuted).Padding(0, 10, 4, 10)
+		for _, dir := range recents {
+			row := ui.Row(c.Key("recent:"+dir)).Height(34).Padding(0, 10).Gap(10).Radius(6).
+				AlignItems(ui.Center).Cursor(ui.CursorPointer).Label(repoName(dir)).Tooltip(tildePath(dir))
+			bg := t.Surface.Alpha(0)
+			switch {
+			case row.Pressed():
+				bg = t.SurfacePressed
+			case row.Hovered():
+				bg = t.SurfaceHover
+			}
+			row.Background(row.AnimateColor("bg", bg, microColorAnim))
+			row.Children(func() {
+				ui.Icon(c, IconFolder).Size(14, 14).Shrink(0).TextColor(t.TextMuted)
+				ui.Text(c, repoName(dir)).FontSize(13).SingleLine().Shrink(0).MaxWidth(200)
+				ui.Text(c, tildePath(filepath.Dir(dir))).FontSize(11.5).TextColor(t.TextMuted).
+					SingleLine().Grow(1).Shrink(1).MinWidth(0)
+			})
+			if row.Clicked() {
+				a.requestOpen(dir, false)
+			}
 		}
 	})
 }
@@ -1405,24 +1487,94 @@ func (a *app) modalsView(c *ui.Context, t *ui.Theme) {
 	})
 }
 
-func (a *app) openRepoDialog() {
-	go func() {
-		paths, err := mygo.Dialog.Open(mygo.OpenDialogOptions{
-			Parent:    a.win,
-			Title:     "Open Git Repository",
-			Directory: true,
-		})
-		if err != nil || len(paths) == 0 {
-			return
+// openRepo shows the repository at dir in this window. The window shows that it
+// is opening it, and reads it in the background; what the window showed
+// before is gone at once. The caller changes it between frames (see later).
+func (a *app) openRepo(dir string) {
+	if dir == "" || a.closed {
+		return
+	}
+	if abs, err := filepath.Abs(dir); err == nil {
+		dir = abs
+	}
+	a.resetRepoView()
+	a.repo, a.repoErr = nil, ""
+	a.loading = dir
+	a.repoDir = "" // so that reload takes dir for another repository
+	a.reload(dir)
+	a.syncTitle()
+	if a.reg != nil {
+		a.reg.sync()
+	}
+}
+
+// resetRepoView forgets what the window showed of a repository: the file and
+// the diff open, the commit expanded, the draft of a commit message.
+func (a *app) resetRepoView() {
+	a.clearExplorerFile()
+	a.explorerQuery = ""
+	a.openDirs = make(map[string]bool)
+	a.expandedCommit, a.selectedCommit, a.commitFiles, a.selectedCommitF = "", nil, nil, -1
+	a.diffKind, a.diffTitle, a.diffBadge, a.diffFileStat = diffNone, "", "", nil
+	c := &a.live.content
+	c.diffSeq++
+	c.detailSeq++
+	c.diff = loadedDiff{}
+	a.commitMsg = ""
+	a.recorded = ""
+	a.branchPick.open, a.repoPick.open = false, false
+	a.contentSeq++
+}
+
+// syncTitle names the window after its repository, for the Window menu and
+// the window switcher; its title bar is hidden.
+func (a *app) syncTitle() {
+	if a.win == nil {
+		return
+	}
+	title := "Arbor"
+	if a.repo != nil {
+		title = repoName(a.repo.Root) + " — Arbor"
+	}
+	if title != a.title {
+		a.title = title
+		a.win.SetTitle(title)
+	}
+}
+
+// repoShown is the window having read a repository: it is the one used last.
+func (a *app) repoShown() {
+	a.syncTitle()
+	if a.reg != nil && a.repo != nil && a.recorded != a.repo.Root {
+		a.recorded = a.repo.Root
+		a.reg.repoOpened(a, a.repo.Root)
+	}
+}
+
+// repoFailed is the window not having been able to read the repository at dir.
+// A directory that is not there any more leaves the recent repositories.
+func (a *app) repoFailed(dir string) {
+	a.syncTitle()
+	if a.reg == nil || dir == "" {
+		return
+	}
+	reg := a.reg
+	reg.sync()
+	gone := func() bool {
+		_, err := os.Stat(dir)
+		return os.IsNotExist(err)
+	}
+	if a.live.post == nil {
+		if gone() {
+			reg.forget(dir)
 		}
-		picked := paths[0]
-		if a.win != nil {
-			a.win.Update(func() {
-				a.selectedFile = ""
-				a.diffKind = diffNone
-				a.openDirs = make(map[string]bool)
-				a.reloadRepoAsync(picked)
-			})
+		return
+	}
+	// The directory may be on a disk that is not answering: ask off the UI
+	// thread.
+	go func() {
+		if gone() {
+			a.onUI(func() { reg.forget(dir) })
 		}
 	}()
 }
@@ -1432,29 +1584,35 @@ func main() {
 	if len(os.Args) > 1 {
 		startDir = os.Args[1]
 	}
-	a := newApp(startDir)
-	a.useUserServices()
-	mygo.App.SetMenu(newAppMenu(a.cards.settings, func() {
-		if a.win != nil {
-			a.win.Invalidate()
-		}
-	}))
+	cwd, _ := os.Getwd()
 
-	mygo.App.WhenReady(func() {
-		a.win = mygo.NewWindow(mygo.WindowOptions{
-			Title:          "Arbor",
-			Width:          1280,
-			Height:         820,
-			MinWidth:       820,
-			MinHeight:      520,
-			StateKey:       "arbor-main",
-			TitleBarStyle:  mygo.TitleBarHiddenInset,
-			TitleBarHeight: headerHeight,
-			Vibrancy:       mygo.VibrancySidebar,
-			Content:        ui.View(a.view),
-		})
-		a.attachWindow()
+	reg := newWindowRegistry(mygoHost{}, userSession())
+	reg.newApp = func() *app {
+		a := newBareApp("")
+		a.useUserServices()
+		return a
+	}
+	reg.changed = func() { mygo.App.Dock.SetMenu(reg.dockMenu()) }
+	reg.quitsWithLastWindow = runtime.GOOS != "darwin"
+
+	mygo.App.SetMenu(newAppMenu(sharedSettings(), func() {
+		for _, w := range mygo.Windows() {
+			w.Invalidate()
+		}
+	}, reg.fileMenuItems()...))
+	mygo.App.Dock.SetMenu(reg.dockMenu())
+	mygo.App.OnBeforeQuit(func(*mygo.QuitEvent) { reg.BeginQuit() })
+	mygo.App.OnQuit(reg.Flush)
+	mygo.App.OnActivate(reg.Activated)
+	// With its last window closed, the application stays in the Dock on macOS,
+	// as Mac applications do, and opens a window when it is activated; it
+	// quits elsewhere.
+	mygo.App.OnWindowAllClosed(func() {
+		if runtime.GOOS != "darwin" {
+			mygo.App.Quit()
+		}
 	})
+	mygo.App.WhenReady(func() { reg.Restore(startDir, cwd) })
 	if err := mygo.App.Run(); err != nil {
 		log.Fatal(err)
 	}
