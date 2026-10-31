@@ -37,6 +37,8 @@ type app struct {
 	repoErr  string
 	busyText string
 
+	spanState // perf bookkeeping, see instrument.go
+
 	// Global UI state
 	activeMode    int // 0 = Files, 1 = Git
 	sidebarW      float32
@@ -205,6 +207,7 @@ func isPreferredSourceFile(p string) bool {
 }
 
 func (a *app) applyRepoSnapshot(snap *RepoSnapshot, err error) {
+	defer a.startupReady(err)
 	if err != nil {
 		a.repo = nil
 		a.repoErr = err.Error()
@@ -455,18 +458,13 @@ func (a *app) view(c *ui.Context) {
 	if c.Vibrancy() {
 		c.Root().Background(ui.Transparent)
 	}
-	if a.paints.Pending() {
-		ui.Box(c).Absolute().Width(1).Height(1).Draw(func(*ui.Painter, ui.Rect) { a.paints.Painted() })
-	}
 
 	// Global keyboard shortcuts
-	if c.Shortcut(ui.Cmd, ui.Key1) && a.activeMode != modeFiles {
-		a.activeMode = modeFiles
-		a.contentSeq++
+	if c.Shortcut(ui.Cmd, ui.Key1) {
+		a.switchMode(modeFiles)
 	}
-	if c.Shortcut(ui.Cmd, ui.Key2) && a.activeMode != modeGit {
-		a.activeMode = modeGit
-		a.contentSeq++
+	if c.Shortcut(ui.Cmd, ui.Key2) {
+		a.switchMode(modeGit)
 	}
 	if c.Shortcut(ui.Cmd, ui.KeyR) {
 		a.reloadRepoAsync(a.repoDir)
@@ -488,6 +486,11 @@ func (a *app) view(c *ui.Context) {
 	a.sidebarW = min(max(a.sidebarW, 252), 540)
 
 	a.modalsView(c, t)
+
+	// Last, so a span armed by anything built above is painted in this frame.
+	if a.paints.Pending() {
+		ui.Box(c).Absolute().Width(1).Height(1).Draw(func(*ui.Painter, ui.Rect) { a.paints.Painted() })
+	}
 }
 
 // ============================================================================
@@ -511,12 +514,7 @@ func (a *app) sidebarView(c *ui.Context, t *ui.Theme) {
 			if a.repo != nil {
 				gitBadge = len(a.repo.Staged) + len(a.repo.Unstaged)
 			}
-			segmentedModeSwitcher(c, a.activeMode, gitBadge, func(mode int) {
-				if a.activeMode != mode {
-					a.activeMode = mode
-					a.contentSeq++
-				}
-			})
+			segmentedModeSwitcher(c, a.activeMode, gitBadge, a.switchMode)
 
 			ui.Spacer(c)
 
@@ -662,6 +660,7 @@ func (a *app) filesSidebarBody(c *ui.Context, t *ui.Theme) {
 		}
 	})
 
+	a.trackSearch()
 	q := strings.ToLower(strings.TrimSpace(a.explorerQuery))
 	nodes := a.buildFlatTree(q)
 
@@ -714,7 +713,7 @@ func (a *app) filesSidebarBody(c *ui.Context, t *ui.Theme) {
 			if n.isDir {
 				a.openDirs[n.path] = !a.openDirs[n.path]
 			} else {
-				a.selectExplorerFile(n.path)
+				a.openFile(n.path)
 			}
 		}
 
@@ -1038,7 +1037,7 @@ func (a *app) renderWorkingFileRow(c *ui.Context, t *ui.Theme, st FileStatus) {
 	})
 
 	if row.Clicked() && !actionClicked {
-		a.selectWorkingFile(st)
+		a.openWorkingDiff(st)
 	}
 }
 
@@ -1145,7 +1144,7 @@ func (a *app) renderCommitGraphRow(c *ui.Context, t *ui.Theme, cIdx int) {
 	})
 
 	if row.Clicked() {
-		a.toggleCommit(cIdx)
+		a.expandCommit(cIdx)
 	}
 }
 
@@ -1222,7 +1221,7 @@ func (a *app) renderCommitFileRow(c *ui.Context, t *ui.Theme, cIdx, cfIdx int, c
 
 	if row.Clicked() {
 		a.selectedCommit = &cm
-		a.selectCommitFile(cfIdx)
+		a.openCommitDiff(cfIdx)
 	}
 }
 
@@ -1520,6 +1519,7 @@ func (a *app) openRepoDialog() {
 }
 
 func main() {
+	beginStartup()
 	startDir := ""
 	if len(os.Args) > 1 {
 		startDir = os.Args[1]
@@ -1527,6 +1527,7 @@ func main() {
 	a := newApp(startDir)
 
 	mygo.App.WhenReady(func() {
+		a.startupFirstFrame()
 		a.win = mygo.NewWindow(mygo.WindowOptions{
 			Title:          "Arbor",
 			Width:          1280,

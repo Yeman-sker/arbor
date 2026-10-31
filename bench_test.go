@@ -44,7 +44,7 @@ func TestMain(m *testing.M) {
 
 // benchRepo returns the dirty fixture repository for s, building it on first use.
 // Benchmarks must treat it as read-only.
-func benchRepo(b *testing.B, s fixture.Spec) string {
+func benchRepo(b testing.TB, s fixture.Spec) string {
 	b.Helper()
 	fixtures.mu.Lock()
 	defer fixtures.mu.Unlock()
