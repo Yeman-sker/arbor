@@ -43,7 +43,7 @@ var scenarios = []Scenario{
 	{"open_diff", "click changed files, then the files of a commit", scenarioOpenDiff},
 	{"expand_commit", "click commits in the graph", scenarioExpandCommit},
 	{"search", "type into and clear the file search", scenarioSearch},
-	{"switch_branch", "choose another branch from the branch menu", scenarioSwitchBranch},
+	{"switch_branch", "choose another branch from the branch picker", scenarioSwitchBranch},
 	{"stage_commit", "stage a file, then commit", scenarioStageCommit},
 	{"scroll_frames", "scroll the commit graph, counting dropped frames", scenarioScroll},
 	{"external_change", "change a file behind the app's back", scenarioExternalChange},
@@ -389,11 +389,15 @@ func scenarioSwitchBranch(e *Env) ([]Metric, error) {
 				if err := a.clickKey("btn-branch"); err != nil {
 					return err
 				}
-				item, err := a.node(func(n Node) bool { return n.Role == "menuItemRadio" && n.Label == target }, 3*time.Second)
-				if err != nil {
+				if _, err := a.node(func(n Node) bool { return strings.HasPrefix(n.KeyString(), "picker-q:") }, 3*time.Second); err != nil {
 					return err
 				}
-				return a.Client.Click(item)
+				if err := a.Client.Input(map[string]any{"type": "text", "text": target}); err != nil {
+					return err
+				}
+				// Enter, in order after the text: the rows move as the filter applies,
+				// so a row's position read here may not be where it ends up.
+				return a.Client.Input(map[string]any{"type": "key", "key": "Enter"})
 			})
 			if err != nil {
 				return nil, err
@@ -404,7 +408,7 @@ func scenarioSwitchBranch(e *Env) ([]Metric, error) {
 			current = target
 			ms = append(ms, d)
 		}
-		return []Metric{spanMetric("switch_branch", s, perf.OpSwitchBranch, ms, "branch menu item chosen until the checkout is painted; main <-> a branch 50 commits behind")}, nil
+		return []Metric{spanMetric("switch_branch", s, perf.OpSwitchBranch, ms, "branch filtered and chosen with Enter until the checkout is painted; main <-> a branch 50 commits behind")}, nil
 	})
 }
 
@@ -680,5 +684,17 @@ func scenarioMemory(e *Env) ([]Metric, error) {
 }
 
 func scenarioNewWindow(e *Env) ([]Metric, error) {
-	return []Metric{Skipped("new_window", "", fmt.Sprintf("not implementable until ARB-1 (multi-window): the app has one window and no way to open another; budget %.0f ms", perf.OpNewWindow.BudgetMs()))}, nil
+	return perApp(e, cleanCopy, func(a *App, s fixture.Spec, _ string) ([]Metric, error) {
+		var ms []float64
+		for range e.Runs {
+			d, err := a.measured(perf.OpNewWindow, "File > New Window", func() error {
+				return a.Client.Call("menu", map[string]any{"path": []string{"File", "New Window"}}, nil)
+			})
+			if err != nil {
+				return nil, err
+			}
+			ms = append(ms, d)
+		}
+		return []Metric{spanMetric("new_window", s, perf.OpNewWindow, ms, "New Window chosen until the new window's first paint")}, nil
+	})
 }

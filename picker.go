@@ -291,7 +291,11 @@ func (p *picker) panel(c *ui.Context, t *ui.Theme, panel ui.Element, spec picker
 		ui.Box(c).Absolute().Width(1).Height(1).Draw(func(*ui.Painter, ui.Rect) { paints.Painted() })
 	}
 
-	if p.enter {
+	if p.enter && strings.TrimSpace(p.query) != p.matchQ {
+		// Enter arrived with text the rows don't reflect yet: it means the best
+		// match for that text, so it waits for the next pass.
+		c.Invalidate()
+	} else if p.enter {
 		p.enter = false
 		if total > 0 {
 			picked, alt = p.hi, p.alt

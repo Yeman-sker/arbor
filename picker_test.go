@@ -377,6 +377,20 @@ func TestBranchPickerEnterOnTheCreateRow(t *testing.T) {
 	}
 }
 
+func TestBranchPickerEnterWaitsForTheFilter(t *testing.T) {
+	a, tt := branchesApp(t, 3)
+	openPicker(t, a, tt)
+	// Text and Enter arrive together. This only covers the outcome: the input
+	// order that once chose the stale row needs real events, and the e2e
+	// switch_branch scenario, which types then presses Enter, is what caught it.
+	a.branchPick.query = "fresh"
+	a.branchPick.enter = true
+	tt.Frame()
+	if !a.newBranchOpen || a.newBranchName != "fresh" || a.branchPick.open {
+		t.Fatalf("open=%v name=%q picker=%v", a.newBranchOpen, a.newBranchName, a.branchPick.open)
+	}
+}
+
 // pickerRepo is a repository on main with branches feature-a and feature-b
 // (a has a commit more), and an untouched working tree.
 func pickerRepo(t *testing.T) string {
