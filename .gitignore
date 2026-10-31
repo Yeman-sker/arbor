@@ -5,3 +5,6 @@ mygo_windows_*.syso
 design/
 .agents/
 /arbor
+
+# Per-machine performance baselines and local scenario output (ARB-5)
+/.perf/

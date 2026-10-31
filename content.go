@@ -1,6 +1,7 @@
 package main
 
 import (
+	"arbor/perf"
 	"fmt"
 	"path"
 	"sort"
@@ -51,6 +52,7 @@ func (a *app) openExplorerFile(relPath string) {
 				return
 			}
 			a.showFile(relPath, text, head)
+			a.pending.file.publish(a, seq, perf.PhaseLoadFile, perf.ResultOK)
 		}
 	})
 }
@@ -170,6 +172,7 @@ func (a *app) openWorkingDiff(st FileStatus) {
 		return func() {
 			if c.diffSeq == seq {
 				a.showDiff(key, st.Path, oldText, newText)
+				a.pending.diff.publish(a, seq, perf.PhaseGitShow, perf.ResultOK)
 			}
 		}
 	})
@@ -187,6 +190,7 @@ func (a *app) openCommitDiff(hash string, cf CommitFile) {
 		return func() {
 			if c.diffSeq == seq {
 				a.showDiff(key, cf.Path, oldText, newText)
+				a.pending.diff.publish(a, seq, perf.PhaseGitShow, perf.ResultOK)
 			}
 		}
 	})
@@ -247,12 +251,14 @@ func (a *app) openCommit(hash string) {
 			}
 			if err != nil {
 				a.commitFiles = nil
+				a.pending.detail.publish(a, seq, perf.PhaseGitShow, perf.ResultError)
 				return
 			}
 			a.commitFiles = files
 			if len(files) > 0 {
 				a.selectCommitFile(0)
 			}
+			a.pending.detail.publish(a, seq, perf.PhaseGitShow, perf.ResultOK)
 		}
 	})
 }
