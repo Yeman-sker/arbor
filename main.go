@@ -1,6 +1,7 @@
 package main
 
 import (
+	"arbor/perf"
 	"fmt"
 	"log"
 	"os"
@@ -29,6 +30,7 @@ const (
 )
 
 type app struct {
+	paints   perf.PaintTracker
 	win      *mygo.Window
 	repoDir  string
 	repo     *RepoSnapshot
@@ -453,6 +455,9 @@ func (a *app) view(c *ui.Context) {
 	if c.Vibrancy() {
 		c.Root().Background(ui.Transparent)
 	}
+	if a.paints.Pending() {
+		ui.Box(c).Absolute().Width(1).Height(1).Draw(func(*ui.Painter, ui.Rect) { a.paints.Painted() })
+	}
 
 	// Global keyboard shortcuts
 	if c.Shortcut(ui.Cmd, ui.Key1) && a.activeMode != modeFiles {
@@ -664,7 +669,7 @@ func (a *app) filesSidebarBody(c *ui.Context, t *ui.Theme) {
 	ui.List(c, &a.explorerList, len(nodes), func(i int) {
 		n := nodes[i]
 		selected := !n.isDir && n.path == a.selectedFile
-		row := ui.Row(c.Key("tree:" + n.path)).Height(24).
+		row := ui.Row(c.Key("tree:"+n.path)).Height(24).
 			Padding(0, 8, 0, float32(6+n.depth*14)).Gap(6).Radius(5).
 			AlignItems(ui.Center).Cursor(ui.CursorPointer)
 
@@ -1117,7 +1122,7 @@ func (a *app) renderCommitGraphRow(c *ui.Context, t *ui.Theme, cIdx int) {
 				refScale = 1.05
 			}
 			ui.Row(c).MaxWidth(88).Shrink(0).Padding(1, 5).Radius(4).Clip().
-				Background(col.Alpha(0.16 + 0.06*hoverK)).
+				Background(col.Alpha(0.16+0.06*hoverK)).
 				AnimatePose(ui.Pose{Scale: refScale}, snappyPoseAnim).Children(func() {
 				ui.Text(c, refLabel).FontSize(10).Bold().TextColor(col).SingleLine().Shrink(1).MinWidth(0).Clip()
 			})
@@ -1309,7 +1314,7 @@ func (a *app) filesMainPane(c *ui.Context, t *ui.Theme) {
 		{At: 0, Value: 0},
 		{At: 140 * time.Millisecond, Value: 1, Ease: ui.EaseOut},
 	}, ui.KeyframeOptions{Run: a.contentSeq})
-	edWrap.Opacity(0.75 + 0.25*k).Translate(0, (1-k)*3)
+	edWrap.Opacity(0.75+0.25*k).Translate(0, (1-k)*3)
 	edWrap.Children(func() {
 		editor.View(c, a.codeState).Grow(1).FillWidth()
 	})
@@ -1443,7 +1448,7 @@ func (a *app) gitMainPane(c *ui.Context, t *ui.Theme) {
 		{At: 0, Value: 0},
 		{At: 140 * time.Millisecond, Value: 1, Ease: ui.EaseOut},
 	}, ui.KeyframeOptions{Run: a.contentSeq})
-	diffWrap.Opacity(0.75 + 0.25*k).Translate(0, (1-k)*3)
+	diffWrap.Opacity(0.75+0.25*k).Translate(0, (1-k)*3)
 	diffWrap.Children(func() {
 		editor.DiffView(c, a.diffState).Grow(1).FillWidth()
 	})

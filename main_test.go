@@ -1,6 +1,7 @@
 package main
 
 import (
+	"arbor/perf"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -395,4 +396,20 @@ func TestLoadRepoPerformanceSkipsIgnoredBulkFiles(t *testing.T) {
 	}
 }
 
+func TestPaintTrackerEndsSpanAtPaint(t *testing.T) {
+	var got []perf.Event
+	perf.SetSink(func(e perf.Event) { got = append(got, e) })
+	defer perf.SetSink(nil)
 
+	a := newApp(t.TempDir())
+	tt := ui.NewTester(a.view, 800, 600)
+	tt.Frame()
+	a.paints.Arm(perf.Begin(perf.OpModeSwitch), perf.ResultOK)
+	tt.Frame()
+	if len(got) != 1 || got[0].Op != perf.OpModeSwitch {
+		t.Fatalf("events = %+v", got)
+	}
+	if a.paints.Pending() {
+		t.Fatal("span still pending after paint")
+	}
+}
