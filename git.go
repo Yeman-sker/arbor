@@ -2,7 +2,6 @@ package main
 
 import (
 	"bytes"
-	"fmt"
 	"io"
 	"os"
 	"os/exec"
@@ -98,9 +97,22 @@ func findWorktreeDotGitRoot(dir string) string {
 	}
 }
 
+// gitEnv is the environment every Git command runs in:
+//
+//   - GIT_OPTIONAL_LOCKS=0 stops read-only commands such as `git status` from
+//     rewriting .git/index to refresh its stat cache, which our own file
+//     watcher would see as a change.
+//   - LC_ALL=C keeps Git's messages in English whatever the user's locale is:
+//     the checkout errors we recognise (see classifyCheckoutError) are matched
+//     by their text.
+func gitEnv() []string {
+	return append(os.Environ(), "GIT_OPTIONAL_LOCKS=0", "LC_ALL=C")
+}
+
 func runGit(dir string, args ...string) (string, error) {
 	cmd := exec.Command("git", args...)
 	cmd.Dir = dir
+	cmd.Env = gitEnv()
 	var out, stderr bytes.Buffer
 	cmd.Stdout = &out
 	cmd.Stderr = &stderr
@@ -110,6 +122,7 @@ func runGit(dir string, args ...string) (string, error) {
 			wtArgs := append([]string{"--git-dir=" + filepath.Join(root, ".git"), "--work-tree=" + root}, args...)
 			wtCmd := exec.Command("git", wtArgs...)
 			wtCmd.Dir = root
+			wtCmd.Env = gitEnv()
 			var wtOut, wtErr bytes.Buffer
 			wtCmd.Stdout = &wtOut
 			wtCmd.Stderr = &wtErr
@@ -121,7 +134,7 @@ func runGit(dir string, args ...string) (string, error) {
 		if msg == "" {
 			msg = err.Error()
 		}
-		return "", fmt.Errorf("git %s: %s", strings.Join(args, " "), msg)
+		return "", &GitError{Args: args, Msg: msg}
 	}
 	return out.String(), nil
 }
