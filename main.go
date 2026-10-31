@@ -44,6 +44,7 @@ type app struct {
 	newBranchName string
 	contentSeq    uint64
 	loadSeq       uint64
+	fades         scrollFades
 
 	// Mode 0: Files (Explorer) state
 	openDirs      map[string]bool
@@ -666,7 +667,7 @@ func (a *app) filesSidebarBody(c *ui.Context, t *ui.Theme) {
 	nodes := a.buildFlatTree(q)
 
 	a.explorerList.Key = func(i int) any { return nodes[i].path }
-	ui.List(c, &a.explorerList, len(nodes), func(i int) {
+	a.fades.tree.List(c, t, a.contentSeq, &a.explorerList, len(nodes), func(i int) {
 		n := nodes[i]
 		selected := !n.isDir && n.path == a.selectedFile
 		row := ui.Row(c.Key("tree:"+n.path)).Height(24).
@@ -866,7 +867,7 @@ func (a *app) gitChangesSection(c *ui.Context, t *ui.Theme, totalChanges int) {
 		}
 		return "work:" + st.Path
 	}
-	ui.List(c, &a.changesList, len(changes), func(i int) {
+	a.fades.changes.List(c, t, a.contentSeq, &a.changesList, len(changes), func(i int) {
 		a.renderWorkingFileRow(c, t, changes[i])
 	}).Grow(1).MinHeight(0).PaddingY(2)
 }
@@ -878,7 +879,7 @@ func (a *app) gitCommitsSection(c *ui.Context, t *ui.Theme, topBorder bool) {
 	}
 	rows := a.buildCommitGraphRows()
 	a.gitList.Key = func(i int) any { return rows[i].key }
-	ui.List(c, &a.gitList, len(rows), func(i int) {
+	a.fades.graph.List(c, t, a.contentSeq, &a.gitList, len(rows), func(i int) {
 		r := rows[i]
 		if r.kind == gitRowCommit {
 			a.renderCommitGraphRow(c, t, r.commitIdx)
@@ -1316,7 +1317,7 @@ func (a *app) filesMainPane(c *ui.Context, t *ui.Theme) {
 	}, ui.KeyframeOptions{Run: a.contentSeq})
 	edWrap.Opacity(0.75+0.25*k).Translate(0, (1-k)*3)
 	edWrap.Children(func() {
-		editor.View(c, a.codeState).Grow(1).FillWidth()
+		a.fades.code.Editor(c, t, a.contentSeq, a.codeState).Grow(1).FillWidth()
 	})
 }
 
