@@ -109,8 +109,14 @@ func gitEnv() []string {
 	return append(os.Environ(), "GIT_OPTIONAL_LOCKS=0", "LC_ALL=C")
 }
 
+// gitArgs keeps non-ASCII paths readable: by default Git prints them as
+// quoted octal escapes in status and diff output.
+func gitArgs(args ...string) []string {
+	return append([]string{"-c", "core.quotePath=false"}, args...)
+}
+
 func runGit(dir string, args ...string) (string, error) {
-	cmd := exec.Command("git", args...)
+	cmd := exec.Command("git", gitArgs(args...)...)
 	cmd.Dir = dir
 	cmd.Env = gitEnv()
 	var out, stderr bytes.Buffer
@@ -120,7 +126,7 @@ func runGit(dir string, args ...string) (string, error) {
 		// Fallback when a hook/tool temporarily flips core.bare=true on a standard .git worktree
 		if root := findWorktreeDotGitRoot(dir); root != "" {
 			wtArgs := append([]string{"--git-dir=" + filepath.Join(root, ".git"), "--work-tree=" + root}, args...)
-			wtCmd := exec.Command("git", wtArgs...)
+			wtCmd := exec.Command("git", gitArgs(wtArgs...)...)
 			wtCmd.Dir = root
 			wtCmd.Env = gitEnv()
 			var wtOut, wtErr bytes.Buffer
