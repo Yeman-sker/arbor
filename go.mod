@@ -4,7 +4,7 @@ go 1.27.3
 
 tool github.com/egoist/mygo/cmd/mygo
 
-require github.com/egoist/mygo v0.7.3
+require github.com/egoist/mygo v0.7.4-0.20261031101927-5e6b2964bf35
 
 require (
 	github.com/ebitengine/purego v0.11.1 // indirect
