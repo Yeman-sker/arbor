@@ -60,12 +60,27 @@ type StashEntry struct {
 	Message string
 }
 
+// Branch is a local branch, as the branch picker lists it.
+type Branch struct {
+	Name string
+	// Current is set for the branch the repository's working tree had checked
+	// out when it was read. RepoSnapshot.Branch is kept up to date by a
+	// refresh of the working tree, so it is the one to compare names with.
+	Current bool
+	// Worktree is the path of another worktree that has the branch checked
+	// out, which keeps this one from switching to it. It is empty for a branch
+	// nobody has checked out and for the current one.
+	Worktree string
+	// Time is the committer date of the branch's tip, zero when unknown.
+	Time time.Time
+}
+
 type RepoSnapshot struct {
 	Root        string
 	Branch      string
 	Ahead       int
 	Behind      int
-	Branches    []string
+	Branches    []Branch
 	Stashes     []StashEntry
 	Staged      []FileStatus
 	Unstaged    []FileStatus
@@ -173,7 +188,7 @@ func LoadRepo(dir string) (*RepoSnapshot, error) {
 	}()
 	go func() {
 		defer wg.Done()
-		brOut, brErr = runGit(root, "for-each-ref", "--sort=-committerdate", "refs/heads/", "--format=%(refname:short)")
+		brOut, brErr = runGit(root, "for-each-ref", "--sort=-committerdate", "refs/heads/", "--format="+branchFormat)
 	}()
 	go func() {
 		defer wg.Done()
@@ -198,11 +213,7 @@ func LoadRepo(dir string) (*RepoSnapshot, error) {
 
 	// Local branches
 	if brErr == nil {
-		for _, line := range strings.Split(strings.TrimSpace(brOut), "\n") {
-			if line = strings.TrimSpace(line); line != "" {
-				snap.Branches = append(snap.Branches, line)
-			}
-		}
+		snap.Branches = parseBranches(brOut)
 	}
 
 	// Stashes
@@ -228,6 +239,50 @@ func LoadRepo(dir string) (*RepoSnapshot, error) {
 		buildWorkspaceTreeFallback(root, snap)
 	}
 	return snap, nil
+}
+
+// branchFormat is the for-each-ref format parseBranches reads: whether the
+// branch is checked out here (*), its name, the committer date of its tip and
+// the worktree that has it checked out, separated by tabs. The path is last
+// because it may hold anything but a newline.
+const branchFormat = "%(HEAD)%09%(refname:lstrip=2)%09%(committerdate:unix)%09%(worktreepath)"
+
+// parseBranches reads the output of for-each-ref with branchFormat. The
+// current branch comes first and the others follow by the date of their tip,
+// newest first, whatever order Git listed them in.
+func parseBranches(out string) []Branch {
+	var branches []Branch
+	for _, line := range strings.Split(out, "\n") {
+		line = strings.TrimRight(line, "\r")
+		if line == "" {
+			continue
+		}
+		f := strings.SplitN(line, "\t", 4)
+		if len(f) < 2 || f[1] == "" {
+			continue
+		}
+		b := Branch{Name: f[1], Current: strings.TrimSpace(f[0]) == "*"}
+		if len(f) > 2 {
+			if secs, err := strconv.ParseInt(f[2], 10, 64); err == nil && secs > 0 {
+				b.Time = time.Unix(secs, 0)
+			}
+		}
+		if len(f) > 3 && !b.Current {
+			b.Worktree = f[3]
+		}
+		branches = append(branches, b)
+	}
+	sort.SliceStable(branches, func(i, j int) bool {
+		a, b := branches[i], branches[j]
+		switch {
+		case a.Current != b.Current:
+			return a.Current
+		case !a.Time.Equal(b.Time):
+			return a.Time.After(b.Time)
+		}
+		return a.Name < b.Name
+	})
+	return branches
 }
 
 func parseStatusV2(out string, snap *RepoSnapshot) {

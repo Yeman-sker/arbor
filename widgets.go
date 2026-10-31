@@ -336,12 +336,19 @@ func ghostBtn(c *ui.Context, key string, ic *ui.SVG, label, tip string, active b
 	return btn.Clicked()
 }
 
-// ghostMenuBtn renders a borderless Linear-style dropdown button with an icon, label, and animated chevron.
-func ghostMenuBtn(c *ui.Context, key string, ic *ui.SVG, label, tip string, build func(m *ui.Menu)) {
+// ghostDropdownBtn renders a borderless Linear-style dropdown button with an
+// icon, label, and animated chevron. It returns the button, for a popover to
+// attach to, and whether it was clicked. A maxWidth of 0 lets the button
+// shrink to the room it gets; any other keeps it at that width at most.
+func ghostDropdownBtn(c *ui.Context, key string, ic *ui.SVG, label, tip string, maxWidth float32) (ui.Element, bool) {
 	t := c.Theme()
-	btn := ui.ButtonBase(c.Key(key)).Height(26).Padding(0, 6).Gap(3.5).Radius(5).
-		Shrink(0).MaxWidth(112).Clip().
+	btn := ui.ButtonBase(c.Key(key)).Height(26).Padding(0, 6).Gap(3.5).Radius(5).Clip().
 		AlignItems(ui.Center).Cursor(ui.CursorPointer).Label(label)
+	if maxWidth > 0 {
+		btn.Shrink(0).MaxWidth(maxWidth)
+	} else {
+		btn.Shrink(1).MinWidth(0)
+	}
 	if tip != "" {
 		btn.Tooltip(tip)
 	}
@@ -386,7 +393,7 @@ func ghostMenuBtn(c *ui.Context, key string, ic *ui.SVG, label, tip string, buil
 		ch := ui.Icon(c, IconChevronDown).Size(11, 11).Shrink(0).TextColor(t.TextMuted)
 		ch.Translate(0, ch.Spring("y", chevY, snappySpring))
 	})
-	btn.PopoverMenuButton(build)
+	return btn, btn.Clicked()
 }
 
 // primaryActionBtn renders a compact Linear indigo action button with hover lift, glow, and press compression.

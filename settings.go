@@ -132,10 +132,12 @@ func sharedSettings() *settingsStore {
 
 // newAppMenu is the application menu: the standard one, with the settings
 // that are switches in its View menu. changed asks the windows to redraw.
-func newAppMenu(settings *settingsStore, changed func()) *mygo.Menu {
+// fileItems, when there are any, are the items of the File menu in place of
+// the standard one's.
+func newAppMenu(settings *settingsStore, changed func(), fileItems ...*mygo.MenuItem) *mygo.Menu {
 	return mygo.NewMenu([]*mygo.MenuItem{
 		{Role: mygo.RoleAppMenu},
-		{Role: mygo.RoleFileMenu},
+		{Role: mygo.RoleFileMenu, Submenu: fileItems},
 		{Role: mygo.RoleEditMenu},
 		{Role: mygo.RoleViewMenu, Submenu: []*mygo.MenuItem{
 			{Role: mygo.RoleReload},

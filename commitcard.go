@@ -7,10 +7,10 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 	"unicode/utf8"
 
-	"github.com/egoist/mygo"
 	"github.com/egoist/mygo/ui"
 )
 
@@ -85,6 +85,9 @@ type commitCards struct {
 	// deferred are the jobs of an app without a window, which has no thread
 	// to run them on: drain runs them.
 	deferred []func() func()
+	// stopped is set when the window closes: the jobs that have not started
+	// do not, and what the others find is dropped.
+	stopped atomic.Bool
 }
 
 // useUserServices connects the app to the user's settings file and the
@@ -106,18 +109,33 @@ func (cc *commitCards) avatarsEnabled() bool {
 }
 
 // spawn runs job off the UI thread and publishes the function it returns on
-// the UI thread. Without a window the job waits for drain.
-func (cc *commitCards) spawn(win *mygo.Window, job func() func()) {
-	if win == nil {
+// the UI thread, through post (the window's Update). Without a window the job
+// waits for drain. A closed window starts no job, and drops the result of one
+// that was running: Window.Update runs what it is given whether the window is
+// there or not.
+func (cc *commitCards) spawn(post func(func()), job func() func()) {
+	if post == nil {
 		cc.deferred = append(cc.deferred, job)
 		return
 	}
 	go func() {
-		if publish := job(); publish != nil {
-			win.Update(publish)
+		if cc.stopped.Load() {
+			return
 		}
+		publish := job()
+		if publish == nil {
+			return
+		}
+		post(func() {
+			if !cc.stopped.Load() {
+				publish()
+			}
+		})
 	}()
 }
+
+// stop ends the jobs of the cards, for a window that has closed.
+func (cc *commitCards) stop() { cc.stopped.Store(true) }
 
 // drain runs the jobs of an app without a window, and publishes what they
 // return, as the window would.
@@ -133,7 +151,7 @@ func (cc *commitCards) drain() {
 
 // stat returns the size of a commit once it has loaded, and starts loading it
 // the first time it is asked for. Commits never change, so it loads once.
-func (cc *commitCards) stat(win *mygo.Window, root, hash string) (commitStat, bool) {
+func (cc *commitCards) stat(post func(func()), root, hash string) (commitStat, bool) {
 	key := root + "\x00" + hash
 	if e, ok := cc.stats[key]; ok {
 		return e.stat, e.state == statReady
@@ -146,7 +164,7 @@ func (cc *commitCards) stat(win *mygo.Window, root, hash string) (commitStat, bo
 	if load == nil {
 		load = loadCommitStat
 	}
-	cc.spawn(win, func() func() {
+	cc.spawn(post, func() func() {
 		st, err := load(root, hash)
 		return func() {
 			if err != nil {
@@ -162,14 +180,14 @@ func (cc *commitCards) stat(win *mygo.Window, root, hash string) (commitStat, bo
 // githubRepo returns the GitHub repository the origin remote of the
 // repository at root points to, once looked up, and starts looking it up the
 // first time it is asked for.
-func (cc *commitCards) githubRepo(win *mygo.Window, root string) (githubRepo, bool) {
+func (cc *commitCards) githubRepo(post func(func()), root string) (githubRepo, bool) {
 	if cc.remote.root != root || cc.remote.state == 0 {
 		cc.remote = cardRemote{root: root, state: remoteLoading}
 		load := cc.remoteLoad
 		if load == nil {
 			load = loadOriginURL
 		}
-		cc.spawn(win, func() func() {
+		cc.spawn(post, func() func() {
 			repo, ok := parseGitHubRemote(load(root))
 			return func() {
 				if cc.remote.root != root {
@@ -282,7 +300,7 @@ func (a *app) commitCardContent(c *ui.Context, t *ui.Theme, row, tip ui.Element,
 	if a.repo != nil {
 		root = a.repo.Root
 	}
-	stat, haveStat := cc.stat(a.win, root, cm.Hash)
+	stat, haveStat := cc.stat(a.live.post, root, cm.Hash)
 
 	shadow := ui.RGBA(0, 0, 0, 0.14)
 	if t.Dark {
@@ -361,7 +379,7 @@ func (a *app) cardAvatar(email, sha string, author bool) *ui.Bitmap {
 	if email == "" || !cc.avatarsEnabled() || a.repo == nil {
 		return nil
 	}
-	repo, ok := cc.githubRepo(a.win, a.repo.Root)
+	repo, ok := cc.githubRepo(a.live.post, a.repo.Root)
 	if !ok {
 		return nil
 	}
