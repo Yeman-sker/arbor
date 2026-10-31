@@ -61,6 +61,8 @@ type Result struct {
 	BytesBase  float64
 	BytesCur   float64
 	Note       string
+	// Reruns is how many times a suspected regression was run again to confirm it.
+	Reruns int
 
 	// Tighten says which parts of the baseline the new runs improve.
 	TightenTime, TightenAllocs bool
@@ -166,6 +168,86 @@ func compareOne(name string, b, c Series, o Options) Result {
 		r.Note = ""
 	}
 	return r
+}
+
+// Confirm runs the benchmarks judged a time regression again, at most rounds
+// times, before the verdict stands. A shared machine has stretches that are
+// slower for a while (other builds, thermal state); a real slowdown shows in
+// every round, a stretch does not. The round with the lowest median is the one
+// judged, because noise only ever slows a benchmark. rerun runs the named
+// benchmarks again; allocation regressions are not run again, as they do not
+// vary with the machine. It returns the final results and the runs they were
+// judged on.
+func Confirm(base, cur map[string]Series, rs []Result, rerun func(names []string) (map[string]Series, error), rounds int, o Options) ([]Result, map[string]Series, error) {
+	cur = copySeries(cur)
+	for round := 1; round <= rounds; round++ {
+		var names []string
+		for _, r := range rs {
+			if r.Status == StatusRegression {
+				names = append(names, r.Name)
+			}
+		}
+		if len(names) == 0 {
+			break
+		}
+		fresh, err := rerun(names)
+		if err != nil {
+			return rs, cur, err
+		}
+		for _, name := range names {
+			f, ok := fresh[name]
+			if !ok || len(f.Ns) < o.MinRuns {
+				return rs, cur, fmt.Errorf("re-running %s to confirm a slowdown produced no usable results", name)
+			}
+			if Median(f.Ns) < Median(cur[name].Ns) {
+				cur[name] = f
+			}
+		}
+		for i, r := range rs {
+			if r.Status != StatusRegression {
+				continue
+			}
+			nr := compareOne(r.Name, base[r.Name], cur[r.Name], o)
+			nr.Reruns = round
+			switch {
+			case nr.Status == StatusRegression:
+				nr.Note = fmt.Sprintf("reproduced in %d runs", round+1)
+			case nr.Status.Failed():
+				nr.Note = fmt.Sprintf("after %d reruns", round)
+			default:
+				nr.Note = fmt.Sprintf("slower once, not reproduced in %d rerun(s)", round)
+			}
+			rs[i] = nr
+		}
+	}
+	return rs, cur, nil
+}
+
+// NoisyLimit is the spread, as a share of the median, above which a recorded
+// benchmark is called noisy.
+const NoisyLimit = 0.25
+
+// Noisy lists the benchmarks whose runs spread over more than limit of their
+// median (slowest minus fastest). A baseline with such a benchmark was most
+// likely recorded while the machine was busy, and comparisons against it are
+// unreliable; record it again when the machine is quiet.
+func Noisy(m map[string]Series, limit float64) []string {
+	var out []string
+	for _, name := range Names(m) {
+		ns := m[name].Ns
+		if med := Median(ns); med > 0 && (maxOf(ns)-minOf(ns))/med > limit {
+			out = append(out, name)
+		}
+	}
+	return out
+}
+
+func copySeries(m map[string]Series) map[string]Series {
+	out := make(map[string]Series, len(m))
+	for k, v := range m {
+		out[k] = v
+	}
+	return out
 }
 
 func maxOf(xs []float64) float64 {

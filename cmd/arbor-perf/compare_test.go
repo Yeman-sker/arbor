@@ -231,6 +231,92 @@ func TestNewAndMissingBenchmarks(t *testing.T) {
 	}
 }
 
+// A slow stretch of a shared machine slows the first run; the rerun is the
+// evidence. A real slowdown shows again.
+func TestConfirmClearsASlowStretchAndKeepsARealRegression(t *testing.T) {
+	base := map[string]Series{"Stretch/x": s(steady, 10, 5), "Real/x": s(steady, 10, 5), "Fine/x": s(steady, 10, 5)}
+	slow := s([]float64{150, 150, 150, 150, 150}, 10, 5)
+	cur := map[string]Series{"Stretch/x": slow, "Real/x": slow, "Fine/x": s(steady, 10, 5)}
+	rs := Compare(base, cur, false, DefaultOptions)
+	if !Failed(rs) {
+		t.Fatal("the slow runs were not flagged to begin with")
+	}
+
+	var asked [][]string
+	rerun := func(names []string) (map[string]Series, error) {
+		asked = append(asked, names)
+		return map[string]Series{
+			"Real/x":    s([]float64{148, 149, 150, 151, 152}, 10, 5),
+			"Stretch/x": s(steady, 10, 5), // the machine is quiet again
+		}, nil
+	}
+	final, judged, err := Confirm(base, cur, rs, rerun, 2, DefaultOptions)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := map[string]Result{}
+	for _, r := range final {
+		got[r.Name] = r
+	}
+	if got["Stretch/x"].Status.Failed() || got["Stretch/x"].Note == "" {
+		t.Errorf("a slowdown that did not reproduce failed: %+v", got["Stretch/x"])
+	}
+	if got["Real/x"].Status != StatusRegression || got["Real/x"].Reruns != 2 {
+		t.Errorf("a slowdown that reproduced was cleared: %+v", got["Real/x"])
+	}
+	if got["Fine/x"].Reruns != 0 {
+		t.Errorf("a benchmark that was fine was run again: %+v", got["Fine/x"])
+	}
+	if len(asked) != 2 || len(asked[1]) != 1 || asked[1][0] != "Real/x" {
+		t.Errorf("rounds asked for %v: only what still regressed should be run again", asked)
+	}
+	if Median(judged["Stretch/x"].Ns) != 100 || Median(cur["Stretch/x"].Ns) != 150 {
+		t.Errorf("judged runs %v, inputs must not change", judged["Stretch/x"].Ns)
+	}
+	if !Failed(final) {
+		t.Error("the real regression must still fail the comparison")
+	}
+}
+
+// A rerun that finds nothing (a wrong pattern) must not pass as "not reproduced".
+func TestConfirmFailsLoudlyWhenTheRerunProducesNothing(t *testing.T) {
+	base := map[string]Series{"A": s(steady, 10, 5)}
+	cur := map[string]Series{"A": s([]float64{150, 150, 150, 150, 150}, 10, 5)}
+	rs := Compare(base, cur, false, DefaultOptions)
+	_, _, err := Confirm(base, cur, rs, func([]string) (map[string]Series, error) { return nil, nil }, 2, DefaultOptions)
+	if err == nil {
+		t.Fatal("an empty rerun was accepted")
+	}
+}
+
+func TestConfirmDoesNotRerunAllocationRegressions(t *testing.T) {
+	base := map[string]Series{"A": s(steady, 10, 5)}
+	cur := map[string]Series{"A": s(steady, 10, 6)}
+	rs := Compare(base, cur, false, DefaultOptions)
+	called := false
+	final, _, err := Confirm(base, cur, rs, func([]string) (map[string]Series, error) { called = true; return nil, nil }, 2, DefaultOptions)
+	if err != nil || called || final[0].Status != StatusAllocRegression {
+		t.Fatalf("called=%v err=%v final=%+v", called, err, final)
+	}
+}
+
+func TestNoisyFlagsABaselineRecordedOnABusyMachine(t *testing.T) {
+	m := map[string]Series{
+		"Quiet": s([]float64{100, 101, 99, 100, 102}, 1, 1),
+		"Busy":  s([]float64{108, 92, 74, 66, 65, 64, 61}, 1, 1), // a machine that calmed down
+	}
+	if got := Noisy(m, NoisyLimit); len(got) != 1 || got[0] != "Busy" {
+		t.Fatalf("noisy = %v", got)
+	}
+}
+
+func TestFamiliesNamesEachParentOnce(t *testing.T) {
+	got := families([]string{"Frame/search/large", "GitStatus/small", "Frame/git/small", "NewApp"})
+	if strings.Join(got, ",") != "Frame,GitStatus,NewApp" {
+		t.Fatalf("families = %v", got)
+	}
+}
+
 func TestTooFewRunsCannotBeCompared(t *testing.T) {
 	r := one(t, s(steady, 1, 1), s([]float64{100, 100, 100}, 1, 1))
 	if r.Status != StatusTooFewRuns || !r.Status.Failed() {

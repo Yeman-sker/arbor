@@ -19,6 +19,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"sort"
 	"strconv"
 	"strings"
 	"text/tabwriter"
@@ -177,6 +178,11 @@ func record(c config, stdin io.Reader, stdout, stderr io.Writer) int {
 		return 2
 	}
 	fmt.Fprintf(stdout, "recorded %d benchmarks for %s\n  %s\n", len(out.Benchmarks), m.Key, path)
+	if noisy := Noisy(out.Benchmarks, NoisyLimit); len(noisy) > 0 {
+		fmt.Fprintf(stdout, "warning: %d of the benchmarks varied by more than %.0f%% between runs (%s): the machine was probably busy;\n"+
+			"comparisons against a noisy baseline are unreliable, so record it again when the machine is quiet\n",
+			len(noisy), NoisyLimit*100, strings.Join(noisy, ", "))
+	}
 	return 0
 }
 
@@ -202,6 +208,25 @@ func compare(c config, stdin io.Reader, stdout, stderr io.Writer) int {
 		return 2
 	}
 	results := Compare(base.Benchmarks, out.Benchmarks, c.bench != ".", DefaultOptions)
+	if c.input == "" && hasStatus(results, StatusRegression) {
+		// Only a slowdown that shows again is a regression: see Confirm.
+		rerun := func(names []string) (map[string]Series, error) {
+			// go test matches the whole name of a top-level benchmark, with its prefix.
+			pattern := "^Benchmark(" + strings.Join(families(names), "|") + ")$"
+			fmt.Fprintf(stderr, "arbor-perf: re-running %s to confirm a slowdown...\n", pattern)
+			raw, err := runBenchmarks(c.root, pattern, c.benchtime, c.count, stderr)
+			if err != nil {
+				return nil, fmt.Errorf("go test: %w", err)
+			}
+			again, err := ParseBench(bytes.NewReader(raw))
+			return again.Benchmarks, err
+		}
+		var err error
+		if results, out.Benchmarks, err = Confirm(base.Benchmarks, out.Benchmarks, results, rerun, confirmRounds, DefaultOptions); err != nil {
+			fmt.Fprintf(stderr, "arbor-perf: %v\n", err)
+			return 2
+		}
+	}
 	printReport(stdout, m, results)
 
 	failed := Failed(results)
@@ -219,6 +244,34 @@ func compare(c config, stdin io.Reader, stdout, stderr io.Writer) int {
 		return 1
 	}
 	return 0
+}
+
+// confirmRounds is how many times a suspected slowdown is run again.
+const confirmRounds = 2
+
+func hasStatus(rs []Result, s Status) bool {
+	for _, r := range rs {
+		if r.Status == s {
+			return true
+		}
+	}
+	return false
+}
+
+// families names the top-level benchmarks (before the first slash) of names,
+// each once: go test selects sub-benchmarks by their parent.
+func families(names []string) []string {
+	seen := map[string]bool{}
+	var out []string
+	for _, n := range names {
+		top, _, _ := strings.Cut(n, "/")
+		if !seen[top] {
+			seen[top] = true
+			out = append(out, top)
+		}
+	}
+	sort.Strings(out)
+	return out
 }
 
 func printReport(w io.Writer, m Machine, rs []Result) {
