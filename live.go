@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/egoist/mygo/ui"
@@ -32,6 +33,8 @@ type liveState struct {
 	gen uint64
 	q   *gitQueue
 	w   *repoWatch
+	// loads counts the background loads in flight. For tests.
+	loads sync.WaitGroup
 
 	// writes counts the operations that change the repository, queued or
 	// running; the refresh button waits while there are any.
@@ -46,6 +49,8 @@ type liveState struct {
 
 	// lastFull is when a full refresh last finished.
 	lastFull time.Time
+
+	content contentState
 
 	// Seams for tests; nil uses the real ones.
 	loadRepo   func(dir string) (*RepoSnapshot, error)
@@ -124,6 +129,31 @@ func (a *app) publisher() func(func()) {
 		}
 		post(guarded)
 	}
+}
+
+// goLoad runs work off the UI thread and then the function it returns on it.
+// Without a window both run right here.
+func (a *app) goLoad(work func() func()) {
+	if a.live.post == nil {
+		if apply := work(); apply != nil {
+			apply()
+		}
+		return
+	}
+	post, gen := a.live.post, a.live.gen
+	a.live.loads.Add(1)
+	go func() {
+		defer a.live.loads.Done()
+		apply := work()
+		if apply == nil {
+			return
+		}
+		post(func() {
+			if a.live.gen == gen {
+				apply()
+			}
+		})
+	}()
 }
 
 // spinStart shows label in the sidebar's spinner until spinEnd(id).

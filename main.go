@@ -219,13 +219,14 @@ func (a *app) applyRepoSnapshot(snap *RepoSnapshot, err error) {
 	}
 
 	// Ensure a diff target is ready in Git mode
+	a.syncCommitSelection(snap)
 	if a.diffKind == diffNone {
 		if len(snap.Unstaged) > 0 {
 			a.selectWorkingFile(snap.Unstaged[0])
 		} else if len(snap.Staged) > 0 {
 			a.selectWorkingFile(snap.Staged[0])
 		} else if len(snap.Commits) > 0 {
-			a.toggleCommit(0)
+			a.expandDefaultCommit()
 		}
 	} else if a.diffKind == diffWorking && a.diffFileStat != nil {
 		// Re-sync working file or fall back if it was committed/discarded
@@ -253,7 +254,7 @@ func (a *app) applyRepoSnapshot(snap *RepoSnapshot, err error) {
 			} else if len(snap.Staged) > 0 {
 				a.selectWorkingFile(snap.Staged[0])
 			} else if len(snap.Commits) > 0 {
-				a.toggleCommit(0)
+				a.expandDefaultCommit()
 			}
 		}
 	}
@@ -266,65 +267,36 @@ func (a *app) selectExplorerFile(relPath string) {
 	if _, isDir := a.repo.TreeDirs[relPath]; isDir {
 		return
 	}
-	if a.selectedFile != relPath {
-		a.contentSeq++
-	}
 	a.selectedFile = relPath
-	content := ReadWorktreeFile(a.repo.Root, relPath)
-	lang := editor.LanguageFor(relPath)
-	a.codeState.Buffer.SetLanguage(lang)
-	a.codeState.Buffer.Reset(content)
-	if headText := ReadFileAtRef(a.repo.Root, "HEAD", relPath); headText != "" {
-		a.codeState.DiffBase = editor.NewBuffer(headText)
-	} else {
-		a.codeState.DiffBase = nil
-	}
+	a.openExplorerFile(relPath) // content.go: reads the file in the background
 }
 
 func (a *app) selectWorkingFile(st FileStatus) {
 	if a.repo == nil {
 		return
 	}
-	if a.diffKind != diffWorking || a.diffTitle != st.Path || (a.diffFileStat != nil && a.diffFileStat.Staged != st.Staged) {
-		a.contentSeq++
-	}
 	stCopy := st
 	a.diffKind = diffWorking
 	a.diffFileStat = &stCopy
 	a.diffTitle = st.Path
 	a.diffBadge = st.Badge()
-	oldText, newText := LoadWorkingDiffTexts(a.repo.Root, st)
-	a.setDiffBuffers(st.Path, oldText, newText)
+	a.openWorkingDiff(st) // content.go: loads both sides in the background
 }
 
 func (a *app) toggleCommit(idx int) {
 	if a.repo == nil || idx < 0 || idx >= len(a.repo.Commits) {
 		return
 	}
-	cm := a.repo.Commits[idx]
-	if a.expandedCommit == cm.Hash {
+	if a.expandedCommit == a.repo.Commits[idx].Hash {
 		a.expandedCommit = ""
 		return
 	}
-	a.expandedCommit = cm.Hash
-	a.selectedCommit = &cm
-	_, files, err := LoadCommitDetails(a.repo.Root, cm.Hash)
-	if err != nil {
-		a.commitFiles = nil
-		return
-	}
-	a.commitFiles = files
-	if len(files) > 0 {
-		a.selectCommitFile(0)
-	}
+	a.expandCommit(idx) // content.go: loads the files in the background
 }
 
 func (a *app) selectCommitFile(fIdx int) {
 	if a.repo == nil || a.selectedCommit == nil || fIdx < 0 || fIdx >= len(a.commitFiles) {
 		return
-	}
-	if a.diffKind != diffCommitFile || a.selectedCommitF != fIdx {
-		a.contentSeq++
 	}
 	a.selectedCommitF = fIdx
 	cf := a.commitFiles[fIdx]
@@ -332,8 +304,7 @@ func (a *app) selectCommitFile(fIdx int) {
 	a.diffFileStat = nil
 	a.diffTitle = cf.Path
 	a.diffBadge = cf.Status
-	oldText, newText := LoadCommitFileDiffTexts(a.repo.Root, a.selectedCommit.Hash, cf)
-	a.setDiffBuffers(cf.Path, oldText, newText)
+	a.openCommitDiff(a.selectedCommit.Hash, cf) // content.go
 }
 
 func (a *app) setDiffBuffers(path, oldText, newText string) {

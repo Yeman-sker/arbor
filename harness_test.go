@@ -129,6 +129,7 @@ func (h *harness) settle() {
 		if q := h.a.live.q; q != nil {
 			q.wait()
 		}
+		h.a.live.loads.Wait()
 		n := h.fake.drain()
 		h.tt.Frame()
 		if n == 0 && h.quiet() {
