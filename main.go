@@ -44,6 +44,7 @@ type app struct {
 	sidebarW      float32
 	newBranchOpen bool
 	newBranchName string
+	branchPick    picker
 	contentSeq    uint64
 	fades         scrollFades
 
@@ -474,28 +475,11 @@ func (a *app) sidebarView(c *ui.Context, t *ui.Theme) {
 				a.openRepoDialog()
 			}
 
-			ghostMenuBtn(c, "btn-branch", IconGitBranch, a.repo.Branch, "Switch or create branch ("+a.repo.Branch+")", func(m *ui.Menu) {
-				if m.Item("+ New Branch…").Chosen() {
-					a.newBranchName = ""
-					a.newBranchOpen = true
-				}
-				m.Separator()
-				const maxMenuBranches = 40
-				shownCurrent := false
-				limit := min(len(a.repo.Branches), maxMenuBranches)
-				for _, br := range a.repo.Branches[:limit] {
-					if br == a.repo.Branch {
-						shownCurrent = true
-					}
-					if m.Item(br).Radio(br == a.repo.Branch).Chosen() && br != a.repo.Branch {
-						target := br
-						a.checkoutBranch(target, false)
-					}
-				}
-				if !shownCurrent && a.repo.Branch != "" {
-					m.Item(a.repo.Branch).Radio(true)
-				}
-			})
+			branchBtn, branchClicked := ghostDropdownBtn(c, "btn-branch", IconGitBranch, a.repo.Branch, "Switch or create branch ("+a.repo.Branch+")", 112)
+			if branchClicked {
+				a.toggleBranchPicker()
+			}
+			a.branchPicker(c, t, branchBtn)
 
 			ui.Spacer(c)
 

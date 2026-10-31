@@ -258,7 +258,7 @@ func TestLongRepoNameAndMultiLaneGraphNoOverlap(t *testing.T) {
 	a.repo = &RepoSnapshot{
 		Root:        dir,
 		Branch:      "main",
-		Branches:    []string{"main", "method/proto-em", "method/package"},
+		Branches:    []Branch{{Name: "main", Current: true}, {Name: "method/proto-em"}, {Name: "method/package"}},
 		Unstaged:    []FileStatus{{Path: "CLAUDE.md", Work: 'M'}},
 		StatusByRel: map[string]string{"CLAUDE.md": "M"},
 		TreeDirs:    map[string][]string{},
