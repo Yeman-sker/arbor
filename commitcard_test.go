@@ -156,10 +156,6 @@ func count(tt *ui.Tester, text string) int {
 	return strings.Count("\x00"+strings.Join(tt.Texts(), "\x00")+"\x00", "\x00"+text+"\x00")
 }
 
-func hasTextContaining(tt *ui.Tester, sub string) bool {
-	return slices.ContainsFunc(tt.Texts(), func(s string) bool { return strings.Contains(s, sub) })
-}
-
 func TestCommitCardAppearsAfterDelay(t *testing.T) {
 	dir, _ := cardRepo(t)
 	a, tt := cardApp(t, dir, 1280, 800)
