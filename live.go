@@ -10,14 +10,19 @@ import (
 	"github.com/egoist/mygo/ui"
 )
 
-// errorToastLife is how long an error stays on screen: long enough to read a
-// Git message.
-const errorToastLife = 8 * time.Second
+const (
+	// focusRefreshGap is how soon after a full refresh the window gaining
+	// focus does not start another.
+	focusRefreshGap = time.Second
+	// errorToastLife is how long an error stays on screen: long enough to
+	// read a Git message.
+	errorToastLife = 8 * time.Second
+)
 
-// liveState is everything one window keeps to run Git in the background. It
-// belongs to the app, never to the package: several windows each have their
-// own. Except where noted it is owned by the UI thread; workers get what they
-// need as arguments.
+// liveState is everything one window keeps to run Git in the background and
+// to follow the repository as it changes. It belongs to the app, never to the
+// package: several windows each have their own. Except where noted it is
+// owned by the UI thread; workers get what they need as arguments.
 type liveState struct {
 	// post runs a function on the UI thread (Window.Update). It is nil
 	// without a window, and everything then runs inline.
@@ -26,6 +31,7 @@ type liveState struct {
 	// in an earlier one (another repository, a closed window) are dropped.
 	gen uint64
 	q   *gitQueue
+	w   *repoWatch
 
 	// writes counts the operations that change the repository, queued or
 	// running; the refresh button waits while there are any.
@@ -38,8 +44,13 @@ type liveState struct {
 	// askOpen is the open flag of the stash dialog.
 	askOpen bool
 
-	// Seam for tests; nil uses LoadRepo.
-	loadRepo func(dir string) (*RepoSnapshot, error)
+	// lastFull is when a full refresh last finished.
+	lastFull time.Time
+
+	// Seams for tests; nil uses the real ones.
+	loadRepo   func(dir string) (*RepoSnapshot, error)
+	loadStatus func(dir string) (*RepoSnapshot, error)
+	startWatch watchStarter
 }
 
 type spinEntry struct {
@@ -57,13 +68,17 @@ type switchAsk struct {
 // loaders are the functions that read a repository, captured on the UI thread
 // for a worker.
 type loaders struct {
-	repo func(dir string) (*RepoSnapshot, error)
+	repo   func(dir string) (*RepoSnapshot, error)
+	status func(dir string) (*RepoSnapshot, error)
 }
 
 func (a *app) loaders() loaders {
-	l := loaders{repo: LoadRepo}
+	l := loaders{repo: LoadRepo, status: LoadWorktreeState}
 	if a.live.loadRepo != nil {
 		l.repo = a.live.loadRepo
+	}
+	if a.live.loadStatus != nil {
+		l.status = a.live.loadStatus
 	}
 	return l
 }
@@ -76,24 +91,17 @@ func (a *app) queue() *gitQueue {
 	return a.live.q
 }
 
-// attachWindow connects the app to its window, once it exists: results of
-// background work are published through it, and it ends the session when the
-// window closes.
-func (a *app) attachWindow() {
-	a.endSession()
-	a.live.post = a.win.Update
-	a.win.OnClosed(a.endSession)
-}
-
 // endSession ends everything running for the repository on screen: queued
-// work is dropped and results still on their way are ignored. It is called
-// when another repository is opened and when the window closes.
+// work is dropped, the watchers stop and results still on their way are
+// ignored. It is called when another repository is opened and when the window
+// closes.
 func (a *app) endSession() {
 	a.live.gen++
 	if q := a.live.q; q != nil {
 		q.close()
 		a.live.q = nil
 	}
+	a.stopWatch()
 	a.live.writes = 0
 	a.live.spins = nil
 	a.busyText = ""
@@ -156,7 +164,7 @@ func (a *app) runGitOp(op perf.Op, label string, fn func(root string) error) {
 		return
 	}
 	root := a.repo.Root
-	q, pub, ld := a.queue(), a.publisher(), a.loaders()
+	q, pub, w, ld := a.queue(), a.publisher(), a.live.w, a.loaders()
 	span := perf.Begin(op)
 	a.live.writes++
 	spin := a.spinStart(label)
@@ -171,6 +179,7 @@ func (a *app) runGitOp(op perf.Op, label string, fn func(root string) error) {
 		// after itself.
 		reloaded := !q.hasQueuedWrite()
 		if reloaded {
+			w.recordFingerprint()
 			snap, lerr = ld.repo(root)
 			span.Mark(perf.PhaseLoadRepo)
 			if snap != nil {
@@ -178,6 +187,9 @@ func (a *app) runGitOp(op perf.Op, label string, fn func(root string) error) {
 			}
 		}
 		pub(func() { a.finishWrite(label, span, spin, err, reloaded, snap, lerr) })
+		if reloaded {
+			w.refreshIgnored()
+		}
 	})
 }
 
@@ -251,32 +263,70 @@ func (a *app) requestRefresh(req refreshReq) {
 	if req.manual {
 		req.spins = append(req.spins, a.spinStart("Loading…"))
 	}
-	pub, ld := a.publisher(), a.loaders()
-	a.queue().addRefresh(req, func(req refreshReq) { runRefresh(a, pub, ld, req) })
+	pub, w, ld := a.publisher(), a.live.w, a.loaders()
+	a.queue().addRefresh(req, func(req refreshReq) { runRefresh(a, pub, w, ld, req) })
+}
+
+// externalChange refreshes the repository after something outside Arbor
+// changed it, without a spinner and without complaining if that fails.
+func (a *app) externalChange(scope refreshScope) {
+	if a.repo == nil {
+		return
+	}
+	a.requestRefresh(refreshReq{scope: scope, dir: a.repo.Root, span: perf.Begin(perf.OpExternalChange)})
+}
+
+// onFocus is the fallback for changes the watchers did not report.
+func (a *app) onFocus() {
+	if a.repo == nil || time.Since(a.live.lastFull) < focusRefreshGap {
+		return
+	}
+	a.externalChange(scopeFull)
 }
 
 // runRefresh reads the repository on the queue's goroutine and publishes
 // what it found. It touches no state of the app but through pub.
-func runRefresh(a *app, pub func(func()), ld loaders, req refreshReq) {
+func runRefresh(a *app, pub func(func()), w *repoWatch, ld loaders, req refreshReq) {
 	span := req.span
+	if req.scope == scopeStatus {
+		st, err := ld.status(req.dir)
+		span.Mark(perf.PhaseGitStatus)
+		if st != nil {
+			span.SetSize(perf.SizeOf(len(st.AllFiles)))
+		}
+		pub(func() { a.finishRefresh(req, span, st, err) })
+		return
+	}
+	w.recordFingerprint()
 	snap, err := ld.repo(req.dir)
 	span.Mark(perf.PhaseLoadRepo)
 	if snap != nil {
 		span.SetSize(perf.SizeOf(len(snap.AllFiles)))
 	}
 	pub(func() { a.finishRefresh(req, span, snap, err) })
+	w.refreshIgnored()
 }
 
-// finishRefresh applies the result of a refresh on the UI thread.
+// finishRefresh applies the result of a refresh on the UI thread. snap is a
+// whole snapshot for scopeFull and the working tree state for scopeStatus.
 func (a *app) finishRefresh(req refreshReq, span perf.Span, snap *RepoSnapshot, err error) {
 	for _, id := range req.spins {
 		a.spinEnd(id)
 	}
 	result := perf.ResultOK
-	if err != nil {
+	switch {
+	case err != nil:
 		result = perf.ResultError
+		a.applyLoaded(req, nil, err)
+	case req.scope == scopeStatus:
+		if a.repo != nil && a.repo.Root == snap.Root {
+			a.applyRepoSnapshot(mergeWorktreeState(a.repo, snap), nil)
+		} else {
+			result = perf.ResultCancelled
+		}
+	default:
+		a.applyLoaded(req, snap, nil)
 	}
-	a.applyLoaded(req, snap, err)
 	span.Mark(perf.PhaseApply)
 	a.paints.Arm(span, result)
 }
@@ -288,6 +338,8 @@ func (a *app) finishRefresh(req refreshReq, span perf.Span, snap *RepoSnapshot, 
 func (a *app) applyLoaded(req refreshReq, snap *RepoSnapshot, err error) {
 	if err == nil {
 		a.applyRepoSnapshot(snap, nil)
+		a.live.lastFull = time.Now()
+		a.ensureWatch()
 		return
 	}
 	switch {

@@ -93,11 +93,16 @@ func findWorktreeDotGitRoot(dir string) string {
 	}
 }
 
-// gitEnv is the environment every Git command runs in. LC_ALL=C keeps Git's
-// messages in English whatever the user's locale is: the checkout errors we
-// recognise (see classifyCheckoutError) are matched by their text.
+// gitEnv is the environment every Git command runs in:
+//
+//   - GIT_OPTIONAL_LOCKS=0 stops read-only commands such as `git status` from
+//     rewriting .git/index to refresh its stat cache, which our own file
+//     watcher would see as a change.
+//   - LC_ALL=C keeps Git's messages in English whatever the user's locale is:
+//     the checkout errors we recognise (see classifyCheckoutError) are matched
+//     by their text.
 func gitEnv() []string {
-	return append(os.Environ(), "LC_ALL=C")
+	return append(os.Environ(), "GIT_OPTIONAL_LOCKS=0", "LC_ALL=C")
 }
 
 func runGit(dir string, args ...string) (string, error) {

@@ -1,6 +1,8 @@
 package main
 
 import (
+	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -8,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/egoist/mygo"
 	"github.com/egoist/mygo/ui"
 )
 
@@ -106,6 +109,11 @@ func newHarness(t *testing.T, dir string) *harness {
 	}
 	fake := &fakeUI{}
 	a.live.post = fake.post
+	// No file watching unless a test asks for it: the changes our own
+	// operations make would otherwise start refreshes at unpredictable times.
+	a.live.startWatch = func(context.Context, string, mygo.FileWatchOptions) (hintSource, error) {
+		return nil, errors.New("watching is off in this test")
+	}
 	h := &harness{t: t, dir: dir, a: a, fake: fake}
 	h.tt = ui.NewTester(a.view, 1280, 800)
 	t.Cleanup(a.endSession)

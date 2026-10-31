@@ -158,10 +158,11 @@ func TestRefreshDisabledAndOrderedWhileWriteRuns(t *testing.T) {
 		t.Fatalf("repository read %d times while the operation ran", loads.Load()-before)
 	}
 
-	// Refreshes requested meanwhile wait their turn and join up.
-	for range 6 {
-		a.requestRefresh(refreshReq{scope: scopeFull})
+	// Changes seen by the watcher meanwhile wait their turn and join up.
+	for range 5 {
+		a.externalChange(scopeStatus)
 	}
+	a.externalChange(scopeFull)
 	if n := a.live.q.queuedRefreshes(); n != 1 {
 		t.Fatalf("%d refreshes queued, want 1", n)
 	}

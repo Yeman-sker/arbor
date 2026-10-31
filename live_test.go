@@ -2,12 +2,16 @@ package main
 
 import (
 	"arbor/perf"
+	"bytes"
 	"errors"
+	"os"
+	"os/exec"
 	"path/filepath"
 	"slices"
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 )
 
 // conflictRepo is a repository on main with a.txt modified in the working
@@ -195,6 +199,9 @@ func TestGitMessagesAreEnglishWhateverTheLocale(t *testing.T) {
 	env := gitEnv()
 	if got := lastEnv(env, "LC_ALL"); got != "C" {
 		t.Fatalf("LC_ALL = %q for Git, want C", got)
+	}
+	if got := lastEnv(env, "GIT_OPTIONAL_LOCKS"); got != "0" {
+		t.Fatalf("GIT_OPTIONAL_LOCKS = %q", got)
 	}
 
 	dir := newTestRepo(t, map[string]string{"a.txt": "base\n"})
@@ -438,8 +445,52 @@ func TestPerfSpansForGitOperations(t *testing.T) {
 	}
 	expect("refresh", perf.OpRefresh, perf.ResultOK, perf.PhaseLoadRepo, perf.PhaseApply)
 
+	a.externalChange(scopeStatus)
+	expect("external status", perf.OpExternalChange, perf.ResultOK, perf.PhaseGitStatus, perf.PhaseApply)
+	a.externalChange(scopeFull)
+	expect("external full", perf.OpExternalChange, perf.ResultOK, perf.PhaseLoadRepo, perf.PhaseApply)
+
 	a.checkoutBranch("no-such-branch", false)
 	expect("failed switch", perf.OpSwitchBranch, perf.ResultError, perf.PhaseGitCheckout, perf.PhaseLoadRepo, perf.PhaseApply)
+}
+
+func TestReadOnlyGitCommandsDoNotRewriteTheIndex(t *testing.T) {
+	dir := newTestRepo(t, map[string]string{"a.txt": "base\n"})
+	// Same content, newer mtime: status has to refresh the index entry.
+	future := time.Date(2031, 1, 2, 3, 4, 5, 0, time.UTC)
+	if err := os.Chtimes(filepath.Join(dir, "a.txt"), future, future); err != nil {
+		t.Fatal(err)
+	}
+	idx := filepath.Join(dir, ".git", "index")
+	read := func() []byte {
+		b, err := os.ReadFile(idx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return b
+	}
+	before := read()
+
+	if _, err := LoadRepo(dir); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LoadWorktreeState(dir); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(read(), before) {
+		t.Fatal("our commands rewrote the index")
+	}
+
+	// The premise: a plain status does rewrite it.
+	cmd := exec.Command("git", "status", "--porcelain")
+	cmd.Dir = dir
+	cmd.Env = append(os.Environ(), "GIT_OPTIONAL_LOCKS=1")
+	if err := cmd.Run(); err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Equal(read(), before) {
+		t.Skip("this Git does not rewrite the index on status; nothing to guard against")
+	}
 }
 
 func TestAppsDoNotShareBackgroundState(t *testing.T) {
@@ -452,13 +503,13 @@ func TestAppsDoNotShareBackgroundState(t *testing.T) {
 	ha.a.live.loadRepo = func(d string) (*RepoSnapshot, error) { loadsA.Add(1); return LoadRepo(d) }
 	hb.a.live.loadRepo = func(d string) (*RepoSnapshot, error) { loadsB.Add(1); return LoadRepo(d) }
 
-	ha.a.requestRefresh(refreshReq{scope: scopeFull})
+	ha.a.externalChange(scopeFull)
 	ha.settle()
 	if loadsA.Load() != 1 || loadsB.Load() != 0 {
 		t.Fatalf("loads: a=%d b=%d", loadsA.Load(), loadsB.Load())
 	}
 	ha.a.endSession()
-	hb.a.requestRefresh(refreshReq{scope: scopeFull})
+	hb.a.externalChange(scopeFull)
 	hb.settle()
 	if loadsB.Load() != 1 || hb.a.repo == nil || hb.a.repo.Root == ha.a.repo.Root {
 		t.Fatalf("second app broken: loads=%d", loadsB.Load())
