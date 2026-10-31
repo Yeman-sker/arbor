@@ -411,3 +411,28 @@ func TestRecordCompareRoundTrip(t *testing.T) {
 		t.Fatalf("record with -count 3 = %d, want a usage error", code)
 	}
 }
+
+func TestReportCommand(t *testing.T) {
+	dir := t.TempDir()
+	log := `{"t":"2026-10-30T10:00:00Z","op":"commit","ms":900,"phases":{"git_write":800},"result":"ok","size":"large","version":"0.2.0"}` + "\n"
+	if err := os.WriteFile(filepath.Join(dir, "perf-2026-10-30.jsonl"), []byte(strings.Repeat(log, 25)), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	out := t.TempDir()
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"report", "-since", "7d", "-now", "2026-10-31T12:00:00Z", "-input", dir, "-out", out}, nil, &stdout, &stderr)
+	if code != 0 || !strings.Contains(stdout.String(), "## commit") || !strings.Contains(stdout.String(), "git_write") {
+		t.Fatalf("code %d\n%s\n%s", code, stdout.String(), stderr.String())
+	}
+	for _, name := range []string{"report.md", "report.json"} {
+		if _, err := os.Stat(filepath.Join(out, name)); err != nil {
+			t.Error(err)
+		}
+	}
+	if code := run([]string{"report", "-since", "soon", "-input", dir}, nil, &stdout, &stderr); code != 2 {
+		t.Fatalf("bad period: code %d", code)
+	}
+	if code := run([]string{"report", "-input", filepath.Join(dir, "none")}, nil, &stdout, &stderr); code != 2 {
+		t.Fatalf("missing input: code %d", code)
+	}
+}

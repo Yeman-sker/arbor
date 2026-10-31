@@ -12,6 +12,7 @@ package main
 
 import (
 	"arbor/internal/fixture"
+	"arbor/internal/perfstore"
 	"bytes"
 	"errors"
 	"flag"
@@ -46,13 +47,15 @@ var runBenchmarks = func(root, bench, benchtime string, count int, progress io.W
 
 func main() { os.Exit(run(os.Args[1:], os.Stdin, os.Stdout, os.Stderr)) }
 
-const usage = `usage: arbor-perf <record|compare> [flags]
+const usage = `usage: arbor-perf <record|compare|report> [flags]
 
   record    run the benchmarks and store the result as this machine's baseline
   compare   run the benchmarks again, report changes, fail on a regression and
             tighten the baseline on improvements
+  report    the ranked report of real usage: -since 7d, -input <logs or export>,
+            -format md|json, -out dir (writes report.md and report.json)
 
-flags:
+flags of record and compare:
   -root dir        repository root (default: found from the working directory)
   -bench regexp    benchmarks to run (default all); a partial run never reports
                    the others as missing
@@ -100,6 +103,9 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		return 2
 	}
 	cmd := args[0]
+	if cmd == "report" {
+		return report(args[1:], stdout, stderr)
+	}
 	if cmd != "record" && cmd != "compare" {
 		fmt.Fprintf(stderr, "arbor-perf: unknown command %q\n\n%s", cmd, usage)
 		return 2
@@ -178,6 +184,7 @@ func record(c config, stdin io.Reader, stdout, stderr io.Writer) int {
 		return 2
 	}
 	fmt.Fprintf(stdout, "recorded %d benchmarks for %s\n  %s\n", len(out.Benchmarks), m.Key, path)
+	appendHistory(c, m, perfstore.BenchRecord, out.Benchmarks, nil, stderr)
 	if noisy := Noisy(out.Benchmarks, NoisyLimit); len(noisy) > 0 {
 		fmt.Fprintf(stdout, "warning: %d of the benchmarks varied by more than %.0f%% between runs (%s): the machine was probably busy;\n"+
 			"comparisons against a noisy baseline are unreliable, so record it again when the machine is quiet\n",
@@ -228,6 +235,11 @@ func compare(c config, stdin io.Reader, stdout, stderr io.Writer) int {
 		}
 	}
 	printReport(stdout, m, results)
+	status := make(map[string]string, len(results))
+	for _, r := range results {
+		status[r.Name] = r.Status.String()
+	}
+	appendHistory(c, m, perfstore.BenchCompare, out.Benchmarks, status, stderr)
 
 	failed := Failed(results)
 	if !c.noUpdate && !failed {
