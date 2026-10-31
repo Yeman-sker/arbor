@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 )
 
 type FileStatus struct {
@@ -41,10 +42,13 @@ type Commit struct {
 	ShortHash string
 	Parents   []string
 	Author    string
-	Date      string
+	Email     string
+	Date      string    // short author date, for the list
+	Time      time.Time // author date with its offset; zero when unparsed
 	Refs      []string
 	Subject   string
-	Body      string
+	Body      string // message after the subject, without trailers
+	CoAuthors []CoAuthor
 }
 
 type CommitFile struct {
@@ -160,7 +164,7 @@ func LoadRepo(dir string) (*RepoSnapshot, error) {
 		defer wg.Done()
 		// shortcut: caps log at 400 commits per load for instant frame times; increase or paginate for deep history
 		logOut, logErr = runGit(root, "log", "--all", "--topo-order", "--date=short", "-n", "400",
-			"--pretty=format:%H%x09%P%x09%h%x09%an%x09%ad%x09%D%x09%s")
+			"--pretty=format:"+commitLogFormat)
 	}()
 	go func() {
 		defer wg.Done()
@@ -195,36 +199,7 @@ func LoadRepo(dir string) (*RepoSnapshot, error) {
 
 	// Commits & Graph
 	if logErr == nil {
-		for _, line := range strings.Split(strings.TrimSpace(logOut), "\n") {
-			if line == "" {
-				continue
-			}
-			parts := strings.SplitN(line, "\t", 7)
-			if len(parts) < 7 {
-				continue
-			}
-			var parents []string
-			if parts[1] != "" {
-				parents = strings.Fields(parts[1])
-			}
-			var refs []string
-			if parts[5] != "" {
-				for _, r := range strings.Split(parts[5], ",") {
-					if r = strings.TrimSpace(r); r != "" {
-						refs = append(refs, r)
-					}
-				}
-			}
-			snap.Commits = append(snap.Commits, Commit{
-				Hash:      parts[0],
-				Parents:   parents,
-				ShortHash: parts[2],
-				Author:    parts[3],
-				Date:      parts[4],
-				Refs:      refs,
-				Subject:   parts[6],
-			})
-		}
+		snap.Commits = parseCommitLog(logOut)
 		snap.Graph = ComputeGraph(snap.Commits)
 	}
 
