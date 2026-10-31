@@ -60,9 +60,9 @@ func TestEverySpanEndsAtPaint(t *testing.T) {
 	}{
 		{"mode switch", perf.OpModeSwitch, func() { a.switchMode(modeGit) }},
 		{"open file", perf.OpOpenFile, func() { a.openFile(fixture.Small.Path(10)) }},
-		{"open working diff", perf.OpOpenDiff, func() { a.openWorkingDiff(unstaged) }},
-		{"expand commit", perf.OpExpandCommit, func() { a.expandCommit(2) }},
-		{"open commit diff", perf.OpOpenDiff, func() { a.openCommitDiff(0) }},
+		{"open working diff", perf.OpOpenDiff, func() { a.clickWorkingDiff(unstaged) }},
+		{"expand commit", perf.OpExpandCommit, func() { a.clickCommit(2) }},
+		{"open commit diff", perf.OpOpenDiff, func() { a.clickCommitDiff(0) }},
 		{"search", perf.OpSearch, func() { a.explorerQuery = "f001"; a.trackSearch() }},
 	}
 	for _, c := range cases {
@@ -86,10 +86,10 @@ func TestEverySpanEndsAtPaint(t *testing.T) {
 
 func TestCollapsingACommitIsNotMeasured(t *testing.T) {
 	a, tt, got := instrumented(t)
-	a.expandCommit(1)
+	a.clickCommit(1)
 	tt.Frame()
 	wantOne(t, got, perf.OpExpandCommit)
-	a.expandCommit(1) // collapses
+	a.clickCommit(1) // collapses
 	tt.Frame()
 	if len(*got) != 0 {
 		t.Fatalf("collapse produced %+v", *got)
@@ -221,5 +221,87 @@ func TestStartupReadyReportsAnError(t *testing.T) {
 	}
 	if ready == nil || ready.Result != perf.ResultError || ready.Size != perf.SizeUnknown {
 		t.Fatalf("events = %+v", *got)
+	}
+}
+
+// TestLoadSpansEndWhereTheContentIsPublished runs the loads on a fake UI thread,
+// as in the app: a click starts the load, and the span must not end at the paint
+// that follows the click but at the one that shows what was loaded.
+func TestLoadSpansEndWhereTheContentIsPublished(t *testing.T) {
+	h := newHarness(t, benchRepo(t, fixture.Small))
+	h.tt.Advance(2 * time.Second)
+	got := collect(t)
+	s := fixture.Small
+	notYet := func(what string) {
+		t.Helper()
+		if len(*got) != 0 {
+			t.Fatalf("%s: reported before the content was published: %+v", what, *got)
+		}
+	}
+
+	// A file of the explorer.
+	if err := h.tt.Click("mod01"); err != nil {
+		t.Fatal(err)
+	}
+	h.settle()
+	notYet("opening a folder")
+	if err := h.tt.Click(filepath.Base(s.Path(10))); err != nil {
+		t.Fatal(err)
+	}
+	notYet("open file")
+	h.settle()
+	wantOne(t, got, perf.OpOpenFile)
+
+	// A second click before the first file arrived replaces it: the first span
+	// is cancelled, the second ends with the content.
+	if err := h.tt.Click(filepath.Base(s.Path(11))); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.tt.Click(filepath.Base(s.Path(12))); err != nil {
+		t.Fatal(err)
+	}
+	if len(*got) != 1 || (*got)[0].Op != perf.OpOpenFile || (*got)[0].Result != perf.ResultCancelled {
+		t.Fatalf("after replacing the load: %+v", *got)
+	}
+	*got = (*got)[:0]
+	h.settle()
+	wantOne(t, got, perf.OpOpenFile)
+
+	// The Git view: a changed file, then a commit and one of its files.
+	if err := h.tt.Click("Git"); err != nil {
+		t.Fatal(err)
+	}
+	wantOne(t, got, perf.OpModeSwitch)
+	h.settle()
+	if err := h.tt.Click(filepath.Base(s.Path(41))); err != nil {
+		t.Fatal(err)
+	}
+	notYet("open working diff")
+	h.settle()
+	wantOne(t, got, perf.OpOpenDiff)
+
+	if err := h.tt.Click(h.a.repo.Commits[3].Subject); err != nil {
+		t.Fatal(err)
+	}
+	notYet("expand commit")
+	h.settle()
+	wantOne(t, got, perf.OpExpandCommit) // the diff it opens by itself is not a click
+	if len(h.a.commitFiles) < 2 {
+		t.Fatalf("commit has %d files", len(h.a.commitFiles))
+	}
+	if err := h.tt.Click(filepath.Base(h.a.commitFiles[1].Path)); err != nil {
+		t.Fatal(err)
+	}
+	notYet("open commit diff")
+	h.settle()
+	wantOne(t, got, perf.OpOpenDiff)
+
+	// Collapsing is not measured.
+	if err := h.tt.Click(h.a.repo.Commits[3].Subject); err != nil {
+		t.Fatal(err)
+	}
+	h.settle()
+	if len(*got) != 0 {
+		t.Fatalf("collapsing reported %+v", *got)
 	}
 }

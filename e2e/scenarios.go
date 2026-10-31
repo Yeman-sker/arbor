@@ -86,50 +86,48 @@ func (a *App) clickKey(key string) error {
 }
 
 // measured performs action and returns the duration of the first span of op the
-// app reports after it.
+// app reports after it. The app reports a span when the operation's result is
+// painted, so a missing one is an error: either the operation failed or its
+// instrumentation is gone.
 func (a *App) measured(op perf.Op, what string, action func() error) (float64, error) {
 	mark := a.Mark()
 	if err := action(); err != nil {
 		return 0, fmt.Errorf("%s: %w", what, err)
 	}
-	r, ok := a.Await(op.String(), mark, 3*time.Second)
+	r, ok := a.Await(op.String(), mark, 10*time.Second)
 	if !ok {
-		return 0, fmt.Errorf("%s: no %s span followed", what, op)
+		shown := ""
+		if nodes, err := a.Client.Tree(); err == nil {
+			shown = "; the window shows: " + Labels(nodes, 40)
+		}
+		return 0, fmt.Errorf("%s: no %s span followed%s\napp output:\n%s", what, op, shown, a.Output())
 	}
 	settle(a)
 	return r.Ms, nil
 }
 
-// timed measures an operation the app may or may not report as a span: the span
-// when it does, else the wall-clock time from the action until done is true.
-func (a *App) timed(op perf.Op, what string, action func() error, done func() bool, limit time.Duration) (ms float64, source string, err error) {
-	mark := a.Mark()
-	t0 := time.Now()
-	if err := action(); err != nil {
-		return 0, "", fmt.Errorf("%s: %w", what, err)
-	}
-	for time.Since(t0) < limit {
-		if r, ok := a.Await(op.String(), mark, 0); ok {
-			settle(a)
-			return r.Ms, "span", nil
+// waitFor waits until the window shows a node that matches.
+func (a *App) waitFor(what string, match func(Node) bool, limit time.Duration) error {
+	deadline := time.Now().Add(limit)
+	for !a.has(match) {
+		if time.Now().After(deadline) {
+			return fmt.Errorf("%s: not shown after %s", what, limit)
 		}
-		if done() {
-			wall := float64(time.Since(t0)) / float64(time.Millisecond)
-			// The span, if there is one, lands with the paint that shows the result.
-			if r, ok := a.Await(op.String(), mark, 300*time.Millisecond); ok {
-				settle(a)
-				return r.Ms, "span", nil
-			}
-			settle(a)
-			return wall, "wall", nil
+		time.Sleep(10 * time.Millisecond)
+	}
+	return nil
+}
+
+// waitGone waits until the window no longer shows a node that matches.
+func (a *App) waitGone(what string, match func(Node) bool, limit time.Duration) error {
+	deadline := time.Now().Add(limit)
+	for a.has(match) {
+		if time.Now().After(deadline) {
+			return fmt.Errorf("%s: still shown after %s", what, limit)
 		}
-		time.Sleep(5 * time.Millisecond)
+		time.Sleep(10 * time.Millisecond)
 	}
-	shown := ""
-	if nodes, err := a.Client.Tree(); err == nil {
-		shown = "; the window shows: " + Labels(nodes, 40)
-	}
-	return 0, "", fmt.Errorf("%s: not done after %s%s\napp output:\n%s", what, limit, shown, a.Output())
+	return nil
 }
 
 // has reports whether the window shows a node that matches.
@@ -179,22 +177,6 @@ func perApp(e *Env, kind repoKind, fn func(a *App, s fixture.Spec, dir string) (
 
 func spanMetric(scenario string, s fixture.Spec, op perf.Op, ms []float64, note string) Metric {
 	return Metric{Scenario: scenario, Size: s.Name, Unit: "ms", Samples: ms, Budget: op.BudgetMs(), HasBudget: true, Source: "span", Note: note}
-}
-
-// timedMetric is a metric that may be a span or a wall-clock time; its source
-// says which, and a wall-clock one says what it includes.
-func timedMetric(scenario string, s fixture.Spec, op perf.Op, ms []float64, sources []string, wallNote string) Metric {
-	m := spanMetric(scenario, s, op, ms, "")
-	m.Source = sources[0]
-	for _, src := range sources {
-		if src != m.Source {
-			m.Source = "mixed"
-		}
-	}
-	if m.Source != "span" {
-		m.Note = wallNote
-	}
-	return m
 }
 
 // ---------------------------------------------------------------------------
@@ -397,14 +379,13 @@ func scenarioSearch(e *Env) ([]Metric, error) {
 func scenarioSwitchBranch(e *Env) ([]Metric, error) {
 	return perApp(e, cleanCopy, func(a *App, s fixture.Spec, _ string) ([]Metric, error) {
 		var ms []float64
-		var sources []string
 		current := "main"
 		for i := 0; i < e.Runs; i++ {
 			target := fixture.Branch(199)
 			if current != "main" {
 				target = "main"
 			}
-			d, src, err := a.timed(perf.OpSwitchBranch, "switch to "+target, func() error {
+			d, err := a.measured(perf.OpSwitchBranch, "switch to "+target, func() error {
 				if err := a.clickKey("btn-branch"); err != nil {
 					return err
 				}
@@ -413,17 +394,17 @@ func scenarioSwitchBranch(e *Env) ([]Metric, error) {
 					return err
 				}
 				return a.Client.Click(item)
-			}, func() bool {
-				return a.has(func(n Node) bool { return n.KeyString() == "btn-branch" && n.Label == target })
-			}, 10*time.Second)
+			})
 			if err != nil {
 				return nil, err
 			}
+			if err := a.waitFor("branch "+target, func(n Node) bool { return n.KeyString() == "btn-branch" && n.Label == target }, 5*time.Second); err != nil {
+				return nil, err
+			}
 			current = target
-			ms, sources = append(ms, d), append(sources, src)
+			ms = append(ms, d)
 		}
-		return []Metric{timedMetric("switch_branch", s, perf.OpSwitchBranch, ms, sources,
-			"wall clock, menu item clicked until the branch name shows (no switch_branch span yet)")}, nil
+		return []Metric{spanMetric("switch_branch", s, perf.OpSwitchBranch, ms, "branch menu item chosen until the checkout is painted; main <-> a branch 50 commits behind")}, nil
 	})
 }
 
@@ -451,48 +432,49 @@ func scenarioStageCommit(e *Env) ([]Metric, error) {
 }
 
 func stageCommit(e *Env, a *App, s fixture.Spec) ([]Metric, error) {
-	{
-		if err := a.clickKey("seg-git"); err != nil {
+	if err := a.clickKey("seg-git"); err != nil {
+		return nil, err
+	}
+	settle(a)
+	unstaged, _, untracked := s.DirtyPaths()
+	files := []string{unstaged[0], unstaged[1], unstaged[2], unstaged[3], untracked[0]}
+	var stageMs, commitMs []float64
+	for i := 0; i < e.Runs && i < len(files); i++ {
+		path := files[i]
+		if err := a.clickKey("work:" + path); err != nil {
 			return nil, err
 		}
 		settle(a)
-		unstaged, _, untracked := s.DirtyPaths()
-		files := []string{unstaged[0], unstaged[1], unstaged[2], unstaged[3], untracked[0]}
-		var stageMs, commitMs []float64
-		var stageSrc, commitSrc []string
-		for i := 0; i < e.Runs && i < len(files); i++ {
-			path := files[i]
-			if err := a.clickKey("work:" + path); err != nil {
-				return nil, err
-			}
-			settle(a)
-			d, src, err := a.timed(perf.OpStage, "stage "+filepath.Base(path), func() error { return a.clickKey("diff-stage") },
-				func() bool { return a.has(ByKey("staged:" + path)) }, 10*time.Second)
-			if err != nil {
-				return nil, err
-			}
-			stageMs, stageSrc = append(stageMs, d), append(stageSrc, src)
-
-			msg := fmt.Sprintf("perf scenario commit %d", i)
-			if err := a.clickKey("commit-msg"); err != nil {
-				return nil, err
-			}
-			if err := a.Client.Input(map[string]any{"type": "text", "text": msg}); err != nil {
-				return nil, err
-			}
-			time.Sleep(100 * time.Millisecond)
-			d, src, err = a.timed(perf.OpCommit, "commit", func() error { return a.clickKey("btn-commit") },
-				func() bool { return !a.has(ByKey("staged:" + path)) }, 10*time.Second)
-			if err != nil {
-				return nil, err
-			}
-			commitMs, commitSrc = append(commitMs, d), append(commitSrc, src)
+		d, err := a.measured(perf.OpStage, "stage "+filepath.Base(path), func() error { return a.clickKey("diff-stage") })
+		if err != nil {
+			return nil, err
 		}
-		return []Metric{
-			timedMetric("stage", s, perf.OpStage, stageMs, stageSrc, "wall clock, Stage clicked until the file is listed as staged (no stage span yet)"),
-			timedMetric("commit", s, perf.OpCommit, commitMs, commitSrc, "wall clock, Commit clicked until the committed file leaves the changes list (no commit span yet)"),
-		}, nil
+		if err := a.waitFor("the staged file", ByKey("staged:"+path), 5*time.Second); err != nil {
+			return nil, err
+		}
+		stageMs = append(stageMs, d)
+
+		msg := fmt.Sprintf("perf scenario commit %d", i)
+		if err := a.clickKey("commit-msg"); err != nil {
+			return nil, err
+		}
+		if err := a.Client.Input(map[string]any{"type": "text", "text": msg}); err != nil {
+			return nil, err
+		}
+		time.Sleep(100 * time.Millisecond)
+		d, err = a.measured(perf.OpCommit, "commit", func() error { return a.clickKey("btn-commit") })
+		if err != nil {
+			return nil, err
+		}
+		if err := a.waitGone("the committed file in the changes list", ByKey("staged:"+path), 5*time.Second); err != nil {
+			return nil, err
+		}
+		commitMs = append(commitMs, d)
 	}
+	return []Metric{
+		spanMetric("stage", s, perf.OpStage, stageMs, "Stage clicked until the file is listed as staged"),
+		spanMetric("commit", s, perf.OpCommit, commitMs, "Commit clicked until the changes list and graph show it"),
+	}, nil
 }
 
 // scrollGraph wheels over the commit graph down and back up and returns the
@@ -565,12 +547,19 @@ func scenarioScroll(e *Env) ([]Metric, error) {
 
 func scenarioExternalChange(e *Env) ([]Metric, error) {
 	return perApp(e, dirtyCopy, func(a *App, s fixture.Spec, dir string) ([]Metric, error) {
-		var ms []float64
+		// Collapse the folder that starts open, so the root of the explorer is short
+		// enough for a new file at its end to be on screen.
+		if err := a.clickKey(filepath.ToSlash(filepath.Dir(filepath.Dir(s.Path(0))))); err != nil {
+			return nil, err
+		}
+		settle(a)
+		var wall, refresh []float64
 		for i := 0; i < e.Runs; i++ {
 			name := fmt.Sprintf("zz_external_%d.txt", i)
+			path := filepath.Join(dir, name)
 			mark := a.Mark()
 			t0 := time.Now()
-			if err := os.WriteFile(filepath.Join(dir, name), []byte("changed behind the app's back\n"), 0o644); err != nil {
+			if err := os.WriteFile(path, []byte("changed behind the app's back\n"), 0o644); err != nil {
 				return nil, err
 			}
 			seen := false
@@ -579,26 +568,31 @@ func scenarioExternalChange(e *Env) ([]Metric, error) {
 					seen = true
 					break
 				}
-				time.Sleep(10 * time.Millisecond)
+				time.Sleep(5 * time.Millisecond)
 			}
 			if !seen {
-				m := Metric{Scenario: "external_change", Size: s.Name, Unit: "ms", Budget: perf.OpExternalChange.BudgetMs(), HasBudget: true, Source: "wall", Status: Fail,
-					Note: fmt.Sprintf("a new file was not shown within %s: the app has no file watcher yet (ARB-4)", externalChangeWait)}
-				os.Remove(filepath.Join(dir, name))
-				return []Metric{m}, nil
+				os.Remove(path)
+				return []Metric{{Scenario: "external_change", Size: s.Name, Unit: "ms", Budget: perf.OpExternalChange.BudgetMs(), HasBudget: true, Source: "wall", Status: Fail,
+					Note: fmt.Sprintf("a new file was not shown within %s", externalChangeWait)}}, nil
 			}
-			wall := float64(time.Since(t0)) / float64(time.Millisecond)
-			if r, ok := a.Await(perf.OpExternalChange.String(), mark, 500*time.Millisecond); ok {
-				ms = append(ms, r.Ms)
-			} else {
-				ms = append(ms, wall)
+			wall = append(wall, float64(time.Since(t0))/float64(time.Millisecond))
+			// The app's span starts when its watcher reports the change, so it
+			// leaves out the time the file system and the debounce took.
+			r, ok := a.Await(perf.OpExternalChange.String(), mark, time.Second)
+			if !ok {
+				return nil, fmt.Errorf("the file was shown but the app reported no external_change span")
 			}
-			os.Remove(filepath.Join(dir, name))
+			refresh = append(refresh, r.Ms)
+			os.Remove(path)
+			settle(a)
+			time.Sleep(300 * time.Millisecond) // let the removal's own refresh pass
 		}
-		m := spanMetric("external_change", s, perf.OpExternalChange, ms, "")
-		m.Source = "wall"
-		m.Note = "wall clock, file written until it is listed in the explorer"
-		return []Metric{m}, nil
+		return []Metric{
+			{Scenario: "external_change", Size: s.Name, Unit: "ms", Samples: wall, Budget: perf.OpExternalChange.BudgetMs(), HasBudget: true, Source: "wall",
+				Note: "a file written until the explorer lists it: includes the file system event and the watcher's debounce"},
+			{Scenario: "external_change_refresh", Size: s.Name, Unit: "ms", Samples: refresh, Source: "span",
+				Note: "the app's own span: watcher event until the refresh is painted"},
+		}, nil
 	})
 }
 

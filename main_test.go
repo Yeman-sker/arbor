@@ -413,3 +413,38 @@ func TestPaintTrackerEndsSpanAtPaint(t *testing.T) {
 		t.Fatal("span still pending after paint")
 	}
 }
+
+func TestNonASCIIPathsStayReadable(t *testing.T) {
+	dir := t.TempDir()
+	for _, args := range [][]string{{"init", "-b", "main"}, {"config", "user.name", "T"}, {"config", "user.email", "t@example.com"}} {
+		if _, err := runGit(dir, args...); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(dir, "文件.txt"), []byte("a\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := runGit(dir, "add", "."); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := runGit(dir, "commit", "-m", "提交"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "新文件.txt"), []byte("b\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	snap, err := LoadRepo(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(snap.Unstaged) != 1 || snap.Unstaged[0].Path != "新文件.txt" {
+		t.Fatalf("unstaged = %+v", snap.Unstaged)
+	}
+	_, files, err := LoadCommitDetails(dir, "HEAD")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(files) != 1 || files[0].Path != "文件.txt" {
+		t.Fatalf("commit files = %+v", files)
+	}
+}

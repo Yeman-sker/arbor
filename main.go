@@ -31,11 +31,13 @@ const (
 
 type app struct {
 	paints   perf.PaintTracker
+	cards    commitCards
 	win      *mygo.Window
 	repoDir  string
 	repo     *RepoSnapshot
 	repoErr  string
 	busyText string
+	live     liveState
 
 	spanState // perf bookkeeping, see instrument.go
 
@@ -45,7 +47,7 @@ type app struct {
 	newBranchOpen bool
 	newBranchName string
 	contentSeq    uint64
-	loadSeq       uint64
+	fades         scrollFades
 
 	// Mode 0: Files (Explorer) state
 	openDirs      map[string]bool
@@ -174,27 +176,7 @@ func (a *app) refreshRepo() {
 }
 
 func (a *app) reloadRepoAsync(dir string) {
-	if dir != "" {
-		a.repoDir = dir
-	}
-	if a.win == nil {
-		a.refreshRepo()
-		return
-	}
-	a.loadSeq++
-	seq := a.loadSeq
-	targetDir := a.repoDir
-	a.busyText = "Loading…"
-	go func() {
-		snap, err := LoadRepo(targetDir)
-		a.win.Update(func() {
-			if a.loadSeq != seq {
-				return
-			}
-			a.busyText = ""
-			a.applyRepoSnapshot(snap, err)
-		})
-	}()
+	a.reload(dir) // live.go: queued with the other Git work
 }
 
 func isPreferredSourceFile(p string) bool {
@@ -238,17 +220,18 @@ func (a *app) applyRepoSnapshot(snap *RepoSnapshot, err error) {
 		}
 		a.selectExplorerFile(pick)
 	} else if a.selectedFile != "" {
-		a.selectExplorerFile(a.selectedFile)
+		a.reselectExplorerFile(snap) // opens another file if this one is gone
 	}
 
 	// Ensure a diff target is ready in Git mode
+	a.syncCommitSelection(snap)
 	if a.diffKind == diffNone {
 		if len(snap.Unstaged) > 0 {
 			a.selectWorkingFile(snap.Unstaged[0])
 		} else if len(snap.Staged) > 0 {
 			a.selectWorkingFile(snap.Staged[0])
 		} else if len(snap.Commits) > 0 {
-			a.toggleCommit(0)
+			a.expandDefaultCommit()
 		}
 	} else if a.diffKind == diffWorking && a.diffFileStat != nil {
 		// Re-sync working file or fall back if it was committed/discarded
@@ -276,37 +259,10 @@ func (a *app) applyRepoSnapshot(snap *RepoSnapshot, err error) {
 			} else if len(snap.Staged) > 0 {
 				a.selectWorkingFile(snap.Staged[0])
 			} else if len(snap.Commits) > 0 {
-				a.toggleCommit(0)
+				a.expandDefaultCommit()
 			}
 		}
 	}
-}
-
-func (a *app) runAsyncGit(label string, fn func(root string) error) {
-	if a.repo == nil {
-		return
-	}
-	root := a.repo.Root
-	a.busyText = label
-	if a.win == nil {
-		_ = fn(root)
-		a.busyText = ""
-		a.refreshRepo()
-		return
-	}
-	a.loadSeq++
-	seq := a.loadSeq
-	go func() {
-		_ = fn(root)
-		snap, err := LoadRepo(root)
-		a.win.Update(func() {
-			if a.loadSeq != seq {
-				return
-			}
-			a.busyText = ""
-			a.applyRepoSnapshot(snap, err)
-		})
-	}()
 }
 
 func (a *app) selectExplorerFile(relPath string) {
@@ -316,65 +272,36 @@ func (a *app) selectExplorerFile(relPath string) {
 	if _, isDir := a.repo.TreeDirs[relPath]; isDir {
 		return
 	}
-	if a.selectedFile != relPath {
-		a.contentSeq++
-	}
 	a.selectedFile = relPath
-	content := ReadWorktreeFile(a.repo.Root, relPath)
-	lang := editor.LanguageFor(relPath)
-	a.codeState.Buffer.SetLanguage(lang)
-	a.codeState.Buffer.Reset(content)
-	if headText := ReadFileAtRef(a.repo.Root, "HEAD", relPath); headText != "" {
-		a.codeState.DiffBase = editor.NewBuffer(headText)
-	} else {
-		a.codeState.DiffBase = nil
-	}
+	a.openExplorerFile(relPath) // content.go: reads the file in the background
 }
 
 func (a *app) selectWorkingFile(st FileStatus) {
 	if a.repo == nil {
 		return
 	}
-	if a.diffKind != diffWorking || a.diffTitle != st.Path || (a.diffFileStat != nil && a.diffFileStat.Staged != st.Staged) {
-		a.contentSeq++
-	}
 	stCopy := st
 	a.diffKind = diffWorking
 	a.diffFileStat = &stCopy
 	a.diffTitle = st.Path
 	a.diffBadge = st.Badge()
-	oldText, newText := LoadWorkingDiffTexts(a.repo.Root, st)
-	a.setDiffBuffers(st.Path, oldText, newText)
+	a.openWorkingDiff(st) // content.go: loads both sides in the background
 }
 
 func (a *app) toggleCommit(idx int) {
 	if a.repo == nil || idx < 0 || idx >= len(a.repo.Commits) {
 		return
 	}
-	cm := a.repo.Commits[idx]
-	if a.expandedCommit == cm.Hash {
+	if a.expandedCommit == a.repo.Commits[idx].Hash {
 		a.expandedCommit = ""
 		return
 	}
-	a.expandedCommit = cm.Hash
-	a.selectedCommit = &cm
-	_, files, err := LoadCommitDetails(a.repo.Root, cm.Hash)
-	if err != nil {
-		a.commitFiles = nil
-		return
-	}
-	a.commitFiles = files
-	if len(files) > 0 {
-		a.selectCommitFile(0)
-	}
+	a.expandCommit(idx) // content.go: loads the files in the background
 }
 
 func (a *app) selectCommitFile(fIdx int) {
 	if a.repo == nil || a.selectedCommit == nil || fIdx < 0 || fIdx >= len(a.commitFiles) {
 		return
-	}
-	if a.diffKind != diffCommitFile || a.selectedCommitF != fIdx {
-		a.contentSeq++
 	}
 	a.selectedCommitF = fIdx
 	cf := a.commitFiles[fIdx]
@@ -382,8 +309,7 @@ func (a *app) selectCommitFile(fIdx int) {
 	a.diffFileStat = nil
 	a.diffTitle = cf.Path
 	a.diffBadge = cf.Status
-	oldText, newText := LoadCommitFileDiffTexts(a.repo.Root, a.selectedCommit.Hash, cf)
-	a.setDiffBuffers(cf.Path, oldText, newText)
+	a.openCommitDiff(a.selectedCommit.Hash, cf) // content.go
 }
 
 func (a *app) setDiffBuffers(path, oldText, newText string) {
@@ -486,6 +412,7 @@ func (a *app) view(c *ui.Context) {
 	a.sidebarW = min(max(a.sidebarW, 252), 540)
 
 	a.modalsView(c, t)
+	a.liveView(c)
 
 	// Last, so a span armed by anything built above is painted in this frame.
 	if a.paints.Pending() {
@@ -521,7 +448,7 @@ func (a *app) sidebarView(c *ui.Context, t *ui.Theme) {
 			if a.busyText != "" {
 				ui.Spinner(c).Label(a.busyText)
 			}
-			if iconBtn(c, "btn-refresh", IconRefresh, "Refresh (⌘R)", a.busyText != "") {
+			if iconBtnState(c, "btn-refresh", IconRefresh, "Refresh (⌘R)", a.busyText != "", a.writeBusy()) {
 				a.reloadRepoAsync(a.repoDir)
 			}
 		})
@@ -560,9 +487,7 @@ func (a *app) sidebarView(c *ui.Context, t *ui.Theme) {
 					}
 					if m.Item(br).Radio(br == a.repo.Branch).Chosen() && br != a.repo.Branch {
 						target := br
-						a.runAsyncGit("Checkout "+target, func(root string) error {
-							return GitCheckoutBranch(root, target, false)
-						})
+						a.checkoutBranch(target, false)
 					}
 				}
 				if !shownCurrent && a.repo.Branch != "" {
@@ -665,7 +590,7 @@ func (a *app) filesSidebarBody(c *ui.Context, t *ui.Theme) {
 	nodes := a.buildFlatTree(q)
 
 	a.explorerList.Key = func(i int) any { return nodes[i].path }
-	ui.List(c, &a.explorerList, len(nodes), func(i int) {
+	a.fades.tree.List(c, t, a.contentSeq, &a.explorerList, len(nodes), func(i int) {
 		n := nodes[i]
 		selected := !n.isDir && n.path == a.selectedFile
 		row := ui.Row(c.Key("tree:"+n.path)).Height(24).
@@ -828,7 +753,7 @@ func (a *app) gitSidebarBody(c *ui.Context, t *ui.Theme) {
 			msg := strings.TrimSpace(a.commitMsg)
 			needStage := len(a.repo.Staged) == 0 && len(a.repo.Unstaged) > 0
 			a.commitMsg = ""
-			a.runAsyncGit("Commit", func(root string) error {
+			a.runGitOp(perf.OpCommit, "Commit", func(root string) error {
 				if needStage {
 					if err := GitStageAll(root); err != nil {
 						return err
@@ -865,7 +790,7 @@ func (a *app) gitChangesSection(c *ui.Context, t *ui.Theme, totalChanges int) {
 		}
 		return "work:" + st.Path
 	}
-	ui.List(c, &a.changesList, len(changes), func(i int) {
+	a.fades.changes.List(c, t, a.contentSeq, &a.changesList, len(changes), func(i int) {
 		a.renderWorkingFileRow(c, t, changes[i])
 	}).Grow(1).MinHeight(0).PaddingY(2)
 }
@@ -877,7 +802,7 @@ func (a *app) gitCommitsSection(c *ui.Context, t *ui.Theme, topBorder bool) {
 	}
 	rows := a.buildCommitGraphRows()
 	a.gitList.Key = func(i int) any { return rows[i].key }
-	ui.List(c, &a.gitList, len(rows), func(i int) {
+	a.fades.graph.List(c, t, a.contentSeq, &a.gitList, len(rows), func(i int) {
 		r := rows[i]
 		if r.kind == gitRowCommit {
 			a.renderCommitGraphRow(c, t, r.commitIdx)
@@ -914,13 +839,13 @@ func (a *app) renderChangesSectionHeader(c *ui.Context, t *ui.Theme, count int) 
 		if len(a.repo.Staged) > 0 {
 			if rowActionBtn(c, "unstage-all", IconMinus, "Unstage All", actionToneWarning) {
 				actionClicked = true
-				a.runAsyncGit("Unstage All", GitUnstageAll)
+				a.runGitOp(perf.OpStage, "Unstage All", GitUnstageAll)
 			}
 		}
 		if len(a.repo.Unstaged) > 0 {
 			if rowActionBtn(c, "stage-all", IconPlus, "Stage All", actionToneSuccess) {
 				actionClicked = true
-				a.runAsyncGit("Stage All", GitStageAll)
+				a.runGitOp(perf.OpStage, "Stage All", GitStageAll)
 			}
 		}
 	})
@@ -1017,7 +942,7 @@ func (a *app) renderWorkingFileRow(c *ui.Context, t *ui.Theme, st FileStatus) {
 					if rowActionBtn(c, "unstage:"+st.Path, IconMinus, "Unstage", actionToneWarning) {
 						actionClicked = true
 						p := st.Path
-						a.runAsyncGit("Unstage", func(root string) error { return GitUnstageFile(root, p) })
+						a.runGitOp(perf.OpStage, "Unstage", func(root string) error { return GitUnstageFile(root, p) })
 					}
 				} else {
 					if rowActionBtn(c, "discard:"+st.Path, IconUndo, "Discard changes", actionToneDanger) {
@@ -1028,7 +953,7 @@ func (a *app) renderWorkingFileRow(c *ui.Context, t *ui.Theme, st FileStatus) {
 					if rowActionBtn(c, "stage:"+st.Path, IconPlus, "Stage", actionToneSuccess) {
 						actionClicked = true
 						p := st.Path
-						a.runAsyncGit("Stage", func(root string) error { return GitStageFile(root, p) })
+						a.runGitOp(perf.OpStage, "Stage", func(root string) error { return GitStageFile(root, p) })
 					}
 				}
 			})
@@ -1037,7 +962,7 @@ func (a *app) renderWorkingFileRow(c *ui.Context, t *ui.Theme, st FileStatus) {
 	})
 
 	if row.Clicked() && !actionClicked {
-		a.openWorkingDiff(st)
+		a.clickWorkingDiff(st)
 	}
 }
 
@@ -1074,8 +999,7 @@ func (a *app) renderCommitGraphRow(c *ui.Context, t *ui.Theme, cIdx int) {
 	graphW := GraphCellWidth(gRow.MaxCols)
 
 	row := ui.Row(c.Key("cm:"+cm.Hash)).Height(30).Padding(0, 8, 0, 2).Gap(5).
-		Radius(5).Margin(0, 4).AlignItems(ui.Center).Clip().Cursor(ui.CursorPointer).
-		Tooltip(cm.ShortHash + " · " + cm.Subject)
+		Radius(5).Margin(0, 4).AlignItems(ui.Center).Clip().Cursor(ui.CursorPointer)
 	hovered := row.Hovered()
 	pressed := row.Pressed()
 
@@ -1143,8 +1067,10 @@ func (a *app) renderCommitGraphRow(c *ui.Context, t *ui.Theme, cIdx int) {
 		}
 	})
 
+	a.commitCard(c, t, row, cm)
+
 	if row.Clicked() {
-		a.expandCommit(cIdx)
+		a.clickCommit(cIdx)
 	}
 }
 
@@ -1221,7 +1147,7 @@ func (a *app) renderCommitFileRow(c *ui.Context, t *ui.Theme, cIdx, cfIdx int, c
 
 	if row.Clicked() {
 		a.selectedCommit = &cm
-		a.openCommitDiff(cfIdx)
+		a.clickCommitDiff(cfIdx)
 	}
 }
 
@@ -1315,7 +1241,7 @@ func (a *app) filesMainPane(c *ui.Context, t *ui.Theme) {
 	}, ui.KeyframeOptions{Run: a.contentSeq})
 	edWrap.Opacity(0.75+0.25*k).Translate(0, (1-k)*3)
 	edWrap.Children(func() {
-		editor.View(c, a.codeState).Grow(1).FillWidth()
+		a.fades.code.Editor(c, t, a.contentSeq, a.codeState).Grow(1).FillWidth()
 	})
 }
 
@@ -1379,11 +1305,11 @@ func (a *app) gitMainPane(c *ui.Context, t *ui.Theme) {
 			st := *a.diffFileStat
 			if st.Staged {
 				if ghostBtn(c, "diff-unstage", IconMinus, "Unstage", "Unstage this file", false) {
-					a.runAsyncGit("Unstage", func(root string) error { return GitUnstageFile(root, st.Path) })
+					a.runGitOp(perf.OpStage, "Unstage", func(root string) error { return GitUnstageFile(root, st.Path) })
 				}
 			} else {
 				if ghostBtn(c, "diff-stage", IconPlus, "Stage", "Stage this file", false) {
-					a.runAsyncGit("Stage", func(root string) error { return GitStageFile(root, st.Path) })
+					a.runGitOp(perf.OpStage, "Stage", func(root string) error { return GitStageFile(root, st.Path) })
 				}
 			}
 			if ghostBtn(c, "diff-open-file", IconFiles, "File", "Read full file in Explorer", false) {
@@ -1487,9 +1413,7 @@ func (a *app) modalsView(c *ui.Context, t *ui.Theme) {
 				name := strings.TrimSpace(a.newBranchName)
 				if (primaryActionBtn(c, "create-branch", IconCheck, "Create", name == "") || sub) && name != "" {
 					a.newBranchOpen = false
-					a.runAsyncGit("Create branch "+name, func(root string) error {
-						return GitCheckoutBranch(root, name, true)
-					})
+					a.checkoutBranch(name, true)
 				}
 			})
 		})
@@ -1525,6 +1449,12 @@ func main() {
 		startDir = os.Args[1]
 	}
 	a := newApp(startDir)
+	a.useUserServices()
+	mygo.App.SetMenu(newAppMenu(a.cards.settings, func() {
+		if a.win != nil {
+			a.win.Invalidate()
+		}
+	}))
 
 	mygo.App.WhenReady(func() {
 		a.startupFirstFrame()
@@ -1540,6 +1470,7 @@ func main() {
 			Vibrancy:       mygo.VibrancySidebar,
 			Content:        ui.View(a.view),
 		})
+		a.attachWindow()
 	})
 	if err := mygo.App.Run(); err != nil {
 		log.Fatal(err)

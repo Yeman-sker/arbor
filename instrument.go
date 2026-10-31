@@ -1,6 +1,9 @@
 package main
 
-import "arbor/perf"
+import (
+	"arbor/perf"
+	"time"
+)
 
 // Performance instrumentation (ARB-5).
 //
@@ -10,14 +13,18 @@ import "arbor/perf"
 // enumerations are recorded; no path, name, message or error text reaches an
 // event. Spans are inert while no sink is installed (perf.SetSink).
 //
-// Git writes (OpStage, OpCommit, OpSwitchBranch, OpRefresh, OpExternalChange)
-// and OpCommitCard are instrumented where those features live.
+// Operations that change the repository (OpStage, OpCommit, OpSwitchBranch,
+// OpRefresh, OpExternalChange) and OpCommitCard are instrumented where those
+// features live (live.go, commitcard.go).
 
 // spanState is the bookkeeping the helpers keep on the app.
 type spanState struct {
 	// searchSeen is the explorer query the last build saw, to tell a changed
 	// query (a search) from a rebuild.
 	searchSeen string
+
+	// pending are the user operations waiting for background loads.
+	pending struct{ file, diff, detail loadSpan }
 }
 
 // startup holds the startup spans from the start of main until the first paint
@@ -82,35 +89,98 @@ func (a *app) switchMode(mode int) {
 	a.paints.Arm(sp, perf.ResultOK)
 }
 
-// openFile is how the user opens a file of the explorer.
+// loadSpan is a user operation waiting for content that loads in the
+// background (content.go). The span begins at the click and is armed where the
+// loaded content is published, so it ends at the paint that shows it. One is
+// pending per kind of load, and seq is the load that will publish it.
+type loadSpan struct {
+	seq   uint64
+	span  perf.Span
+	began time.Time
+}
+
+// staleSpan is how long a span may wait for a load that was replaced without
+// the user clicking again; after that it is dropped rather than reported, as a
+// duration that long would not be what anyone waited for.
+const staleSpan = 5 * time.Second
+
+// start waits for the load numbered seq. A span still waiting for an earlier
+// load was replaced by this click: it ends as cancelled.
+func (l *loadSpan) start(a *app, span perf.Span, seq uint64) {
+	if l.span.Active() && time.Since(l.began) < staleSpan {
+		a.paints.Arm(l.span, perf.ResultCancelled)
+	}
+	*l = loadSpan{}
+	if span.Active() {
+		*l = loadSpan{seq: seq, span: span, began: time.Now()}
+	}
+}
+
+// drop forgets the span: the click started no load, so there is nothing to wait for.
+func (l *loadSpan) drop() { *l = loadSpan{} }
+
+// publish arms the span where load seq put its content on screen. When a later
+// load than the one the click started is the one published, the click's was
+// replaced and its span is cancelled. phase names what the wait was mostly for.
+func (l *loadSpan) publish(a *app, seq uint64, phase perf.Phase, result perf.Result) {
+	if !l.span.Active() {
+		return
+	}
+	if seq > l.seq {
+		result = perf.ResultCancelled
+	}
+	l.span.Mark(phase)
+	a.paints.Arm(l.span, result)
+	*l = loadSpan{}
+}
+
+// openFile is how the user opens a file of the explorer. The text loads in the
+// background: the span ends at the paint after it is shown.
 func (a *app) openFile(rel string) {
-	sp := a.beginOp(perf.OpOpenFile)
+	c := &a.live.content
+	before := c.fileSeq
+	a.pending.file.start(a, a.beginOp(perf.OpOpenFile), before+1)
 	a.selectExplorerFile(rel)
-	a.paints.Arm(sp, perf.ResultOK)
+	if c.fileSeq == before {
+		a.pending.file.drop() // a folder, or no repository: no load began
+	}
 }
 
-// openWorkingDiff is how the user opens the diff of a changed file.
-func (a *app) openWorkingDiff(st FileStatus) {
-	sp := a.beginOp(perf.OpOpenDiff)
+// clickWorkingDiff is how the user opens the diff of a changed file.
+func (a *app) clickWorkingDiff(st FileStatus) {
+	c := &a.live.content
+	before := c.diffSeq
+	a.pending.diff.start(a, a.beginOp(perf.OpOpenDiff), before+1)
 	a.selectWorkingFile(st)
-	a.paints.Arm(sp, perf.ResultOK)
+	if c.diffSeq == before {
+		a.pending.diff.drop()
+	}
 }
 
-// openCommitDiff is how the user opens the diff of a file of the expanded commit.
-func (a *app) openCommitDiff(fIdx int) {
-	sp := a.beginOp(perf.OpOpenDiff)
+// clickCommitDiff is how the user opens the diff of a file of the expanded commit.
+func (a *app) clickCommitDiff(fIdx int) {
+	c := &a.live.content
+	before := c.diffSeq
+	a.pending.diff.start(a, a.beginOp(perf.OpOpenDiff), before+1)
 	a.selectCommitFile(fIdx)
-	a.paints.Arm(sp, perf.ResultOK)
+	if c.diffSeq == before {
+		a.pending.diff.drop()
+	}
 }
 
-// expandCommit is how the user clicks a commit; only expanding one is measured.
-func (a *app) expandCommit(idx int) {
-	var sp perf.Span
-	if a.repo != nil && idx >= 0 && idx < len(a.repo.Commits) && a.expandedCommit != a.repo.Commits[idx].Hash {
-		sp = a.beginOp(perf.OpExpandCommit)
+// clickCommit is how the user clicks a commit of the graph; only expanding one
+// is measured. The span ends at the paint after the commit's files are shown.
+func (a *app) clickCommit(idx int) {
+	c := &a.live.content
+	before := c.detailSeq
+	expanding := a.repo != nil && idx >= 0 && idx < len(a.repo.Commits) && a.expandedCommit != a.repo.Commits[idx].Hash
+	if expanding {
+		a.pending.detail.start(a, a.beginOp(perf.OpExpandCommit), before+1)
 	}
 	a.toggleCommit(idx)
-	a.paints.Arm(sp, perf.ResultOK)
+	if expanding && c.detailSeq == before {
+		a.pending.detail.drop()
+	}
 }
 
 // trackSearch starts a search span in the first build that sees a new explorer

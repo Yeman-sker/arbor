@@ -2,7 +2,6 @@ package main
 
 import (
 	"bytes"
-	"fmt"
 	"io"
 	"os"
 	"os/exec"
@@ -11,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 )
 
 type FileStatus struct {
@@ -41,10 +41,13 @@ type Commit struct {
 	ShortHash string
 	Parents   []string
 	Author    string
-	Date      string
+	Email     string
+	Date      string    // short author date, for the list
+	Time      time.Time // author date with its offset; zero when unparsed
 	Refs      []string
 	Subject   string
-	Body      string
+	Body      string // message after the subject, without trailers
+	CoAuthors []CoAuthor
 }
 
 type CommitFile struct {
@@ -94,9 +97,28 @@ func findWorktreeDotGitRoot(dir string) string {
 	}
 }
 
+// gitEnv is the environment every Git command runs in:
+//
+//   - GIT_OPTIONAL_LOCKS=0 stops read-only commands such as `git status` from
+//     rewriting .git/index to refresh its stat cache, which our own file
+//     watcher would see as a change.
+//   - LC_ALL=C keeps Git's messages in English whatever the user's locale is:
+//     the checkout errors we recognise (see classifyCheckoutError) are matched
+//     by their text.
+func gitEnv() []string {
+	return append(os.Environ(), "GIT_OPTIONAL_LOCKS=0", "LC_ALL=C")
+}
+
+// gitArgs keeps non-ASCII paths readable: by default Git prints them as
+// quoted octal escapes in status and diff output.
+func gitArgs(args ...string) []string {
+	return append([]string{"-c", "core.quotePath=false"}, args...)
+}
+
 func runGit(dir string, args ...string) (string, error) {
-	cmd := exec.Command("git", args...)
+	cmd := exec.Command("git", gitArgs(args...)...)
 	cmd.Dir = dir
+	cmd.Env = gitEnv()
 	var out, stderr bytes.Buffer
 	cmd.Stdout = &out
 	cmd.Stderr = &stderr
@@ -104,8 +126,9 @@ func runGit(dir string, args ...string) (string, error) {
 		// Fallback when a hook/tool temporarily flips core.bare=true on a standard .git worktree
 		if root := findWorktreeDotGitRoot(dir); root != "" {
 			wtArgs := append([]string{"--git-dir=" + filepath.Join(root, ".git"), "--work-tree=" + root}, args...)
-			wtCmd := exec.Command("git", wtArgs...)
+			wtCmd := exec.Command("git", gitArgs(wtArgs...)...)
 			wtCmd.Dir = root
+			wtCmd.Env = gitEnv()
 			var wtOut, wtErr bytes.Buffer
 			wtCmd.Stdout = &wtOut
 			wtCmd.Stderr = &wtErr
@@ -117,7 +140,7 @@ func runGit(dir string, args ...string) (string, error) {
 		if msg == "" {
 			msg = err.Error()
 		}
-		return "", fmt.Errorf("git %s: %s", strings.Join(args, " "), msg)
+		return "", &GitError{Args: args, Msg: msg}
 	}
 	return out.String(), nil
 }
@@ -160,7 +183,7 @@ func LoadRepo(dir string) (*RepoSnapshot, error) {
 		defer wg.Done()
 		// shortcut: caps log at 400 commits per load for instant frame times; increase or paginate for deep history
 		logOut, logErr = runGit(root, "log", "--all", "--topo-order", "--date=short", "-n", "400",
-			"--pretty=format:%H%x09%P%x09%h%x09%an%x09%ad%x09%D%x09%s")
+			"--pretty=format:"+commitLogFormat)
 	}()
 	go func() {
 		defer wg.Done()
@@ -195,36 +218,7 @@ func LoadRepo(dir string) (*RepoSnapshot, error) {
 
 	// Commits & Graph
 	if logErr == nil {
-		for _, line := range strings.Split(strings.TrimSpace(logOut), "\n") {
-			if line == "" {
-				continue
-			}
-			parts := strings.SplitN(line, "\t", 7)
-			if len(parts) < 7 {
-				continue
-			}
-			var parents []string
-			if parts[1] != "" {
-				parents = strings.Fields(parts[1])
-			}
-			var refs []string
-			if parts[5] != "" {
-				for _, r := range strings.Split(parts[5], ",") {
-					if r = strings.TrimSpace(r); r != "" {
-						refs = append(refs, r)
-					}
-				}
-			}
-			snap.Commits = append(snap.Commits, Commit{
-				Hash:      parts[0],
-				Parents:   parents,
-				ShortHash: parts[2],
-				Author:    parts[3],
-				Date:      parts[4],
-				Refs:      refs,
-				Subject:   parts[6],
-			})
-		}
+		snap.Commits = parseCommitLog(logOut)
 		snap.Graph = ComputeGraph(snap.Commits)
 	}
 
