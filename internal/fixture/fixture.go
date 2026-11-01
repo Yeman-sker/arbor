@@ -62,6 +62,17 @@ var (
 	}
 )
 
+// Holdout proves a change on a repository of another shape, with more history
+// and fewer branches. It is only for verdicts: arbor-perf climb try runs on it and
+// reports its result, not its numbers or profile, so that an optimization cannot
+// be fitted to it. Do not read its results to decide what to change, and never
+// special-case its shape in the code.
+var Holdout = Spec{
+	Name: "holdout", Tops: 9, Subs: 7, Per: 60, Branches: 60, Commits: 900,
+	WantMain: "ed018bdaeda6ba0635891c9aaf6c432e722f26a8",
+	WantRefs: "de72222e04d36536877ca2a1fc7b10322e5f68780456492dd92859302ba7fd5c",
+}
+
 // Dirty working-tree state applied by Dirty, in file indexes of the spec.
 var (
 	dirtyUnstaged = []int{3, 17, 41, 77}

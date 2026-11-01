@@ -25,7 +25,7 @@ func TestPinned(t *testing.T) {
 	if _, err := exec.LookPath("git"); err != nil {
 		t.Skip("git not installed")
 	}
-	for _, s := range []Spec{Small, Large} {
+	for _, s := range []Spec{Small, Large, Holdout} {
 		t.Run(s.Name, func(t *testing.T) {
 			if s.Name == "large" && testing.Short() {
 				t.Skip("large fixture skipped with -short")

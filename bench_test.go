@@ -2,8 +2,10 @@ package main
 
 import (
 	"arbor/internal/fixture"
+	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -25,6 +27,13 @@ import (
 // their pins to make a benchmark faster or a comparison pass. A deliberate
 // change belongs in its own reviewed commit that bumps fixture.Version and
 // re-records every baseline.
+//
+// arbor-perf runs these benchmarks as separate processes, and sets:
+//
+//	ARBOR_PERF_FIXTURES  a directory to keep the fixtures in across processes
+//	ARBOR_PERF_HOLDOUT   1 to run on the held-out fixture too; see fixture.Holdout
+//	ARBOR_PERF_SLOWDOWN  a fraction to slow every loop by, as a known change the
+//	                     measuring must be able to see (arbor-perf check)
 
 var fixtures = struct {
 	mu   sync.Mutex
@@ -51,6 +60,21 @@ func benchRepo(b testing.TB, s fixture.Spec) string {
 	if dir, ok := fixtures.dirs[s.Name]; ok {
 		return dir
 	}
+	if shared := os.Getenv("ARBOR_PERF_FIXTURES"); shared != "" {
+		dir := filepath.Join(shared, fmt.Sprintf("v%d", fixture.Version), s.Name)
+		done := dir + ".built"
+		if _, err := os.Stat(done); err != nil {
+			os.RemoveAll(dir)
+			if err := fixture.BuildDirty(dir, s); err != nil {
+				b.Fatalf("build %s fixture: %v", s.Name, err)
+			}
+			if err := os.WriteFile(done, nil, 0o644); err != nil {
+				b.Fatal(err)
+			}
+		}
+		fixtures.dirs[s.Name] = dir
+		return dir
+	}
 	if fixtures.root == "" {
 		root, err := os.MkdirTemp("", "arbor-bench-")
 		if err != nil {
@@ -66,7 +90,35 @@ func benchRepo(b testing.TB, s fixture.Spec) string {
 	return dir
 }
 
-var benchSpecs = []fixture.Spec{fixture.Small, fixture.Large}
+var benchSpecs = func() []fixture.Spec {
+	specs := []fixture.Spec{fixture.Small, fixture.Large}
+	if os.Getenv("ARBOR_PERF_HOLDOUT") == "1" {
+		specs = append(specs, fixture.Holdout)
+	}
+	return specs
+}()
+
+var slowdown, _ = strconv.ParseFloat(os.Getenv("ARBOR_PERF_SLOWDOWN"), 64)
+
+// lastIteration is when injectSlowdown last ran.
+var lastIteration time.Time
+
+// injectSlowdown is the first thing in every benchmark's loop. When ARBOR_PERF_SLOWDOWN
+// is set it spins so that an iteration takes that fraction longer, and otherwise
+// it costs a branch. A gap over a second is the setup of the next benchmark.
+func injectSlowdown() {
+	if slowdown == 0 {
+		return
+	}
+	now := time.Now()
+	if gap := now.Sub(lastIteration); gap < time.Second {
+		// The gap includes the last spin, so it is 1+slowdown times the work.
+		spin := time.Duration(float64(gap) * slowdown / (1 + slowdown))
+		for time.Since(now) < spin {
+		}
+	}
+	lastIteration = now
+}
 
 // perSize runs fn once for each fixture size as the sub-benchmarks small and large.
 func perSize(b *testing.B, fn func(b *testing.B, s fixture.Spec, dir string)) {
@@ -82,6 +134,7 @@ func perSize(b *testing.B, fn func(b *testing.B, s fixture.Spec, dir string)) {
 func BenchmarkLoadRepo(b *testing.B) {
 	perSize(b, func(b *testing.B, _ fixture.Spec, dir string) {
 		for b.Loop() {
+			injectSlowdown()
 			if _, err := LoadRepo(dir); err != nil {
 				b.Fatal(err)
 			}
@@ -92,6 +145,7 @@ func BenchmarkLoadRepo(b *testing.B) {
 func BenchmarkGitStatus(b *testing.B) {
 	perSize(b, func(b *testing.B, _ fixture.Spec, dir string) {
 		for b.Loop() {
+			injectSlowdown()
 			if _, err := runGit(dir, "status", "--porcelain=v2", "--branch", "-uall"); err != nil {
 				b.Fatal(err)
 			}
@@ -109,6 +163,7 @@ func BenchmarkComputeGraph(b *testing.B) {
 			b.Fatalf("fixture has %d commits", len(snap.Commits))
 		}
 		for b.Loop() {
+			injectSlowdown()
 			ComputeGraph(snap.Commits)
 		}
 	})
@@ -117,6 +172,7 @@ func BenchmarkComputeGraph(b *testing.B) {
 func BenchmarkNewApp(b *testing.B) {
 	perSize(b, func(b *testing.B, _ fixture.Spec, dir string) {
 		for b.Loop() {
+			injectSlowdown()
 			if a := newApp(dir); a.repo == nil {
 				b.Fatalf("newApp: %s", a.repoErr)
 			}
@@ -137,6 +193,7 @@ func BenchmarkApplyRepoSnapshot(b *testing.B) {
 			b.StopTimer()
 			a := newApp(empty)
 			b.StartTimer()
+			injectSlowdown()
 			a.applyRepoSnapshot(snap, nil)
 			if a.repo == nil || a.selectedFile == "" || a.diffKind == diffNone {
 				b.Fatal("snapshot not applied")
@@ -167,6 +224,7 @@ func BenchmarkLoadCommitDetails(b *testing.B) {
 		}
 		hash := snap.Commits[mainTipIndex(snap)].Hash
 		for b.Loop() {
+			injectSlowdown()
 			if _, files, err := LoadCommitDetails(dir, hash); err != nil || len(files) == 0 {
 				b.Fatalf("details: %v (%d files)", err, len(files))
 			}
@@ -181,6 +239,7 @@ func BenchmarkExpandCommit(b *testing.B) {
 		a := newApp(dir)
 		idx := mainTipIndex(a.repo)
 		for b.Loop() {
+			injectSlowdown()
 			a.expandedCommit = ""
 			a.toggleCommit(idx)
 			if a.expandedCommit == "" || a.diffKind != diffCommitFile {
@@ -201,6 +260,7 @@ func BenchmarkOpenFile(b *testing.B) {
 		}
 		n := 0
 		for b.Loop() {
+			injectSlowdown()
 			a.selectExplorerFile(paths[n%len(paths)])
 			n++
 		}
@@ -215,6 +275,7 @@ func BenchmarkOpenDiff(b *testing.B) {
 		}
 		st := a.repo.Unstaged[0]
 		for b.Loop() {
+			injectSlowdown()
 			a.selectWorkingFile(st)
 		}
 	})
@@ -247,6 +308,7 @@ func BenchmarkFrame(b *testing.B) {
 					b.Fatal("the view keeps asking for frames, so a frame is not a single settled frame")
 				}
 				for b.Loop() {
+					injectSlowdown()
 					tt.Frame()
 				}
 			})
@@ -274,6 +336,7 @@ func BenchmarkFrameEntrance(b *testing.B) {
 					b.Fatal("entrance animation already finished")
 				}
 				for b.Loop() {
+					injectSlowdown()
 					tt.Frame()
 				}
 			})
