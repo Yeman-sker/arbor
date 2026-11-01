@@ -125,9 +125,19 @@ type benchRun struct {
 	cpuProfile string
 }
 
-// buildBinary compiles the benchmarks of the package at dir; tests replace it.
+// benchPackage is the package of the checkout at dir that holds the benchmarks.
+// Commits from before internal/app kept them at the root, and a round can
+// compare against one of those.
+func benchPackage(dir string) string {
+	if _, err := os.Stat(filepath.Join(dir, "internal", "app")); err == nil {
+		return "./internal/app"
+	}
+	return "."
+}
+
+// buildBinary compiles the benchmarks of the checkout at dir; tests replace it.
 var buildBinary = func(dir, out string) error {
-	cmd := exec.Command("go", "test", "-c", "-o", out, ".")
+	cmd := exec.Command("go", "test", "-c", "-o", out, benchPackage(dir))
 	cmd.Dir = dir
 	cmd.Env = append(os.Environ(), "CGO_ENABLED=0")
 	if msg, err := cmd.CombinedOutput(); err != nil {

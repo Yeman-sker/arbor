@@ -2,6 +2,7 @@
   "name": "Arbor",
   "identifier": "io.github.yemansker.arbor",
   "version": "0.1.0",
+  "main": "./cmd/arbor",
   "out": "build",
   "updates": {
     "publicKey": "JcqwH2QsqKUptmLpoHosa5psrpCAzmpLukV42UN+UXk=",

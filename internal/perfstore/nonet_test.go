@@ -33,13 +33,13 @@ func TestNoPackageOfThePerfSystemImportsTheNetwork(t *testing.T) {
 		}
 	}
 	// The app's own files for the diagnostics and the Performance window.
-	root, err := os.ReadDir("../..")
+	appDir, err := os.ReadDir("../app")
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, e := range root {
+	for _, e := range appDir {
 		if strings.HasPrefix(e.Name(), "perf") && strings.HasSuffix(e.Name(), ".go") {
-			files = append(files, filepath.Join("../..", e.Name()))
+			files = append(files, filepath.Join("../app", e.Name()))
 		}
 	}
 	if len(files) < 8 {

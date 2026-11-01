@@ -529,3 +529,16 @@ func TestCompareJSON(t *testing.T) {
 		t.Fatalf("%+v", v)
 	}
 }
+
+func TestBenchPackageFollowsTheCheckout(t *testing.T) {
+	dir := t.TempDir()
+	if got := benchPackage(dir); got != "." {
+		t.Fatalf("a checkout from before internal/app: %q", got)
+	}
+	if err := os.MkdirAll(filepath.Join(dir, "internal", "app"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if got := benchPackage(dir); got != "./internal/app" {
+		t.Fatalf("a checkout with internal/app: %q", got)
+	}
+}

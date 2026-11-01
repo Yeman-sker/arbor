@@ -21,7 +21,7 @@ import (
 // neither. -o keeps the binary out of the repository.
 func buildApp(root, dir string) (string, error) {
 	bin := filepath.Join(dir, "arbor-e2e")
-	cmd := exec.Command("go", "build", "-tags", "e2e", "-o", bin, ".")
+	cmd := exec.Command("go", "build", "-tags", "e2e", "-o", bin, "./cmd/arbor")
 	cmd.Dir = root
 	cmd.Env = append(os.Environ(), "CGO_ENABLED=0")
 	if out, err := cmd.CombinedOutput(); err != nil {

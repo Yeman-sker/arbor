@@ -31,7 +31,7 @@
 
 ```bash
 # 直接从源码运行
-go run .
+go run ./cmd/arbor
 
 # 或使用 mygo 打包原生桌面应用
 mygo build
@@ -40,3 +40,17 @@ mygo build
 ## 开源协议
 
 MIT
+
+## 项目结构
+
+```text
+cmd/arbor/        桌面应用入口
+cmd/arbor-perf/   性能工具（见 docs/perf-climb.md）
+internal/app/     界面：窗口、视图、实时刷新、设置
+internal/git/     Git 命令、解析和提交图布局
+perf/             性能埋点、预算和账本
+internal/perf*/   性能日志、聚合和报告
+internal/fixture/ 基准测试用的仓库
+e2e/              驱动真实应用的场景测试
+resources/        图标等打包资源
+```

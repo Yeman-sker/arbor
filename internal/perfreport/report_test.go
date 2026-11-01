@@ -68,7 +68,7 @@ func TestReportIsDeterministicAndReadable(t *testing.T) {
 		t.Fatal("same data gave different reports")
 	}
 	md := a.Markdown()
-	for _, want := range []string{"## external_change", "live.go, watch.go", "git_status", "switch_branch (thin)", "2 unreadable lines"} {
+	for _, want := range []string{"## external_change", "internal/app/live.go, internal/app/watch.go", "git_status", "switch_branch (thin)", "2 unreadable lines"} {
 		if !strings.Contains(md, want) {
 			t.Errorf("markdown lacks %q:\n%s", want, md)
 		}

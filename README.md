@@ -31,7 +31,7 @@
 
 ```bash
 # Run directly from source
-go run .
+go run ./cmd/arbor
 
 # Or package a native desktop app bundle
 mygo build
@@ -40,3 +40,17 @@ mygo build
 ## License
 
 MIT
+
+## Project layout
+
+```text
+cmd/arbor/        the desktop app's entry point
+cmd/arbor-perf/   performance tooling (see docs/perf-climb.md)
+internal/app/     the interface: windows, views, live refresh, settings
+internal/git/     Git commands, parsing and the commit graph layout
+perf/             performance spans, budgets and the ledger
+internal/perf*/   performance logs, aggregates and reports
+internal/fixture/ the repositories benchmarks run on
+e2e/              scenarios that drive the real app
+resources/        icons and other bundled files
+```

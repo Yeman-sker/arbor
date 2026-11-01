@@ -41,21 +41,21 @@ func (t Target) Reproduce() string {
 // Targets maps every catalog operation to its instrumentation and benchmarks.
 // A test fails when an operation has none.
 var Targets = map[string]Target{
-	"startup_first_frame": {"main.go main, windows.go open, instrument.go", []string{"NewApp"}, true, "startup"},
-	"startup_ready":       {"main.go applyRepoSnapshot, git.go LoadRepo", []string{"LoadRepo", "ApplyRepoSnapshot"}, true, "startup"},
-	"mode_switch":         {"instrument.go switchMode, main.go view", []string{"Frame/files", "Frame/git"}, false, "mode_switch"},
-	"open_file":           {"content.go, instrument.go", []string{"OpenFile"}, false, "open_file"},
-	"open_diff":           {"content.go, instrument.go", []string{"OpenDiff"}, false, "open_diff"},
-	"expand_commit":       {"content.go, git.go LoadCommitDetails", []string{"ExpandCommit", "LoadCommitDetails"}, false, "expand_commit"},
-	"switch_branch":       {"live.go checkoutBranch, gitqueue.go", []string{"LoadRepo"}, true, "switch_branch"},
-	"search":              {"instrument.go, main.go explorer filter", []string{"Frame/search"}, false, "search"},
-	"stage":               {"live.go runGitOp, git.go", []string{"GitStatus", "LoadRepo"}, true, "stage_commit"},
-	"commit":              {"live.go runGitOp, git.go LoadRepo", []string{"LoadRepo"}, true, "stage_commit"},
-	"new_window":          {"windows.go open", []string{"NewApp"}, true, "new_window"},
-	"external_change":     {"live.go, watch.go", []string{"GitStatus", "LoadRepo"}, true, "external_change"},
-	"refresh":             {"live.go, gitload.go", []string{"LoadRepo"}, true, ""},
-	"commit_card":         {"commitcard.go", []string{"Frame/git"}, true, ""},
-	"branch_picker":       {"picker.go", []string{"Frame/git"}, true, ""},
+	"startup_first_frame": {"internal/app/app.go Run, internal/app/windows.go open, internal/app/instrument.go", []string{"NewApp"}, true, "startup"},
+	"startup_ready":       {"internal/app/app.go applyRepoSnapshot, internal/git/git.go LoadRepo", []string{"LoadRepo", "ApplyRepoSnapshot"}, true, "startup"},
+	"mode_switch":         {"internal/app/instrument.go switchMode, internal/app/app.go view", []string{"Frame/files", "Frame/git"}, false, "mode_switch"},
+	"open_file":           {"internal/app/content.go, internal/app/instrument.go", []string{"OpenFile"}, false, "open_file"},
+	"open_diff":           {"internal/app/content.go, internal/app/instrument.go", []string{"OpenDiff"}, false, "open_diff"},
+	"expand_commit":       {"internal/app/content.go, internal/git/git.go LoadCommitDetails", []string{"ExpandCommit", "LoadCommitDetails"}, false, "expand_commit"},
+	"switch_branch":       {"internal/app/live.go checkoutBranch, internal/app/gitqueue.go", []string{"LoadRepo"}, true, "switch_branch"},
+	"search":              {"internal/app/instrument.go, internal/app/app.go explorer filter", []string{"Frame/search"}, false, "search"},
+	"stage":               {"internal/app/live.go runGitOp, internal/git/git.go", []string{"GitStatus", "LoadRepo"}, true, "stage_commit"},
+	"commit":              {"internal/app/live.go runGitOp, internal/git/git.go LoadRepo", []string{"LoadRepo"}, true, "stage_commit"},
+	"new_window":          {"internal/app/windows.go open", []string{"NewApp"}, true, "new_window"},
+	"external_change":     {"internal/app/live.go, internal/app/watch.go", []string{"GitStatus", "LoadRepo"}, true, "external_change"},
+	"refresh":             {"internal/app/live.go, internal/git/load.go", []string{"LoadRepo"}, true, ""},
+	"commit_card":         {"internal/app/commitcard.go", []string{"Frame/git"}, true, ""},
+	"branch_picker":       {"internal/app/picker.go", []string{"Frame/git"}, true, ""},
 }
 
 // MinSamples is the fewest samples of an operation worth ranking.

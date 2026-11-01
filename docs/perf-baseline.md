@@ -132,9 +132,9 @@ Reading the table:
 - **Mode switch** and **search** spans start where the build first sees the action and end at the
   paint, so they measure the app's work (build, layout, paint), not input delivery.
 - **Open file, open diff, expand commit** end at the paint after the background load published its
-  content (`content.go`); a click that replaces a pending load ends the earlier span as cancelled.
+  content (`internal/app/content.go`); a click that replaces a pending load ends the earlier span as cancelled.
   Expanding a commit ends when its file list is shown; the diff of its first file loads after that.
-- **switch_branch, stage, commit** are the spans `live.go` reports for those Git operations: the
+- **switch_branch, stage, commit** are the spans `internal/app/live.go` reports for those Git operations: the
   click until the result is painted.
 - **external_change** is the runner's clock from writing a file until the explorer lists it, which
   includes the file system event and the watcher's debounce; `external_change_refresh` is the app's
