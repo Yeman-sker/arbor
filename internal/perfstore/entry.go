@@ -30,7 +30,7 @@ type Entry struct {
 	Op     string
 	Ms     float64
 	Phases []PhaseMs
-	// Result is ok, error or cancelled; Size small, medium, large or unknown.
+	// Result is ok, error, cancelled or unseen; Size small, medium, large or unknown.
 	Result  string
 	Size    string
 	Version string
@@ -41,6 +41,7 @@ const (
 	ResultOK        = "ok"
 	ResultError     = "error"
 	ResultCancelled = "cancelled"
+	ResultUnseen    = "unseen"
 )
 
 // FromRecord is the entry for a record of package perflog, which turns perf

@@ -421,6 +421,7 @@ func TestPerfSpansForGitOperations(t *testing.T) {
 		}
 		e := events[0]
 		events = nil
+		ps = append(ps, perf.PhasePaint)
 		if e.Op != op || e.Result != res || !slices.Equal(phases(e), ps) {
 			t.Fatalf("%s: op=%v result=%v phases=%v, want %v %v %v", what, e.Op, e.Result, phases(e), op, res, ps)
 		}

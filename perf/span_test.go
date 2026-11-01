@@ -3,6 +3,7 @@ package perf
 import (
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestDisabledSpanIsInert(t *testing.T) {
@@ -110,5 +111,40 @@ func BenchmarkEnabled(b *testing.B) {
 	for b.Loop() {
 		s := Begin(OpOpenFile)
 		s.End(ResultOK)
+	}
+}
+
+func TestPaintChargesItsWaitAndAHeldPaintIsUnseen(t *testing.T) {
+	var got []Event
+	SetSink(func(e Event) { got = append(got, e) })
+	defer SetSink(nil)
+
+	var tr PaintTracker
+	tr.Arm(Begin(OpModeSwitch), ResultOK)
+	tr.Painted()
+	if e := got[0]; e.Result != ResultOK || e.NPhases != 1 || e.Phases[0].Phase != PhasePaint {
+		t.Fatalf("event = %+v", e)
+	}
+
+	// Armed in the background, painted when the window came back much later.
+	got = nil
+	tr.Arm(Begin(OpExternalChange), ResultOK)
+	tr.Arm(Begin(OpRefresh), ResultError)
+	for i := range tr.pending {
+		tr.pending[i].span.ev.Start = tr.pending[i].span.ev.Start.Add(-10*time.Minute - time.Second)
+		tr.pending[i].armed = tr.pending[i].armed.Add(-10 * time.Minute)
+	}
+	tr.Painted()
+	if len(got) != 2 {
+		t.Fatalf("events = %d", len(got))
+	}
+	if e := got[0]; e.Result != ResultUnseen || e.NPhases != 0 || e.Dur < time.Second || e.Dur > 2*time.Second {
+		t.Fatalf("held = %+v", e)
+	}
+	if e := got[1]; e.Result != ResultError {
+		t.Fatalf("a held failure stays a failure: %+v", e)
+	}
+	if tr.Pending() {
+		t.Fatal("still pending")
 	}
 }

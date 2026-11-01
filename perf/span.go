@@ -92,6 +92,23 @@ func (s *Span) End(r Result) {
 	s.ev.Op = OpNone
 }
 
+// endHeld finishes a span whose paint was held: the duration stops at armed, when
+// the work was done, and an operation that went well counts as unseen.
+func (s *Span) endHeld(r Result, armed time.Time) {
+	if s.ev.Op == OpNone {
+		return
+	}
+	if r == ResultOK {
+		r = ResultUnseen
+	}
+	s.ev.Result = r
+	s.ev.Dur = armed.Sub(s.ev.Start)
+	if p := sink.Load(); p != nil {
+		(*p)(s.ev)
+	}
+	s.ev.Op = OpNone
+}
+
 // PaintTracker ends spans at the first paint that contains their new state, so
 // a recorded duration is what the user waited for, excluding GPU present.
 // It is owned by the UI thread.
@@ -102,22 +119,37 @@ type PaintTracker struct {
 type armedSpan struct {
 	span   Span
 	result Result
+	armed  time.Time
 }
+
+// PaintHeld is how long after Arm a paint means the window was not painting
+// rather than slow. An occluded or minimized window holds its frames, so what a
+// span waits for there is the user coming back, not the app. A settled frame
+// takes milliseconds. A real stall this long ends as unseen too, which is the
+// price of telling them apart without asking the window.
+const PaintHeld = 2 * time.Second
 
 // Arm schedules s to end at the next paint. Call it where the new state is published.
 func (t *PaintTracker) Arm(s Span, r Result) {
 	if s.Active() {
-		t.pending = append(t.pending, armedSpan{s, r})
+		t.pending = append(t.pending, armedSpan{s, r, time.Now()})
 	}
 }
 
 // Pending reports whether a span is waiting for a paint.
 func (t *PaintTracker) Pending() bool { return len(t.pending) > 0 }
 
-// Painted ends every armed span. It is safe to call repeatedly.
+// Painted ends every armed span, charging the wait for the paint to PhasePaint so
+// that the phases account for the whole duration. It is safe to call repeatedly.
 func (t *PaintTracker) Painted() {
 	for i := range t.pending {
-		t.pending[i].span.End(t.pending[i].result)
+		p := &t.pending[i]
+		if time.Since(p.armed) > PaintHeld {
+			p.span.endHeld(p.result, p.armed)
+			continue
+		}
+		p.span.Mark(PhasePaint)
+		p.span.End(p.result)
 	}
 	t.pending = t.pending[:0]
 }

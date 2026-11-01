@@ -93,6 +93,7 @@ const (
 	PhaseHighlight
 	PhaseApply
 	PhaseLayout
+	PhasePaint
 	phaseCount
 )
 
@@ -109,6 +110,7 @@ var phaseNames = [phaseCount]string{
 	PhaseHighlight:    "highlight",
 	PhaseApply:        "apply",
 	PhaseLayout:       "layout",
+	PhasePaint:        "paint",
 }
 
 func (p Phase) String() string {
@@ -126,6 +128,10 @@ const (
 	ResultOK Result = iota
 	ResultError
 	ResultCancelled
+	// ResultUnseen is an operation done while its window was not painting, such
+	// as a refresh in the background: nobody waited for it, so its duration is
+	// only the work and it is kept out of the percentiles.
+	ResultUnseen
 )
 
 func (r Result) String() string {
@@ -136,6 +142,8 @@ func (r Result) String() string {
 		return "error"
 	case ResultCancelled:
 		return "cancelled"
+	case ResultUnseen:
+		return "unseen"
 	}
 	return "unknown"
 }
