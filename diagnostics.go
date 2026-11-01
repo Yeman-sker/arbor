@@ -7,6 +7,7 @@ import (
 	"arbor/perf"
 	"fmt"
 	"runtime"
+	"runtime/debug"
 	"time"
 
 	"github.com/egoist/mygo"
@@ -52,6 +53,38 @@ type diagnostics struct {
 
 	store  *perfstore.Store
 	window *perfView
+}
+
+// buildVersion is what the log files a build's operations under: the packaged
+// app's version, else the commit it was built from, so each round of work on the
+// code is its own point on the charts. "" when the build has neither, as with go
+// run, which does not stamp the commit.
+func buildVersion(packaged string) string {
+	if packaged != "" {
+		return packaged
+	}
+	info, ok := debug.ReadBuildInfo()
+	if !ok {
+		return ""
+	}
+	return commitVersion(info.Settings)
+}
+
+func commitVersion(settings []debug.BuildSetting) string {
+	var commit string
+	var dirty bool
+	for _, s := range settings {
+		switch s.Key {
+		case "vcs.revision":
+			commit = s.Value[:min(len(s.Value), 7)]
+		case "vcs.modified":
+			dirty = s.Value == "true"
+		}
+	}
+	if commit != "" && dirty {
+		return commit + "+dirty"
+	}
+	return commit
 }
 
 func newDiagnostics(settings *settingsStore, userData, version string, prompts diagPrompts) *diagnostics {

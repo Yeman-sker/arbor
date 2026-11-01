@@ -6,157 +6,115 @@ import (
 	"time"
 )
 
-// DayPoint is one day of a chart: the median and the 95th percentile of the
-// operation that day.
-type DayPoint struct {
-	// Day is the start of the day in the model's location.
-	Day time.Time
-	// N is how many samples the day has. A day with fewer than MinDaySamples is
-	// a Gap: it is not drawn, and the line is broken there.
+// VersionPoint is one version on a chart: how an operation did on that build.
+type VersionPoint struct {
+	Version string
+	// First is when the version first appeared in the log.
+	First time.Time
+	// N is how many ok samples it has. With none there is nothing to draw, and
+	// with fewer than MinSamples (Thin) the numbers are not evidence yet.
 	N        int
 	P50, P95 float64
-	Gap      bool
-}
-
-// VersionMark is where a new app version first shows in the data.
-type VersionMark struct {
-	Version string
-	At      time.Time
+	Thin     bool
 }
 
 // Filter says which part of the data a summary covers.
 type Filter struct {
 	// Size is small, medium or large; "" for all.
 	Size string
-	// Days is the length of the range in calendar days, ending with the day of
-	// End (the present).
-	Days int
-	End  time.Time
+	// Last is how many of the latest versions to cover; 0 for all of them.
+	Last int
 }
 
 // Summary is everything a card of the Performance window shows about one
-// operation.
+// operation: a point per version, and the latest version with samples in detail.
 type Summary struct {
-	Op string
-	// From is the start of the first day of the range, To the start of the day
-	// after the last.
-	From, To time.Time
+	Op     string
+	Points []VersionPoint
 
-	// N counts the ok samples of the range, Errors and Cancelled the others.
+	// Version is the latest version with samples, and the fields below
+	// describe it. Slowest and Phases exist to explain the number on the card.
+	Version              string
 	N, Errors, Cancelled int
+	Unseen               int
 	P50, P95, P99, Max   float64
+	Phases               []PhaseStat
+	Slowest              []perfstore.Entry
 
-	// Current is the median of the latest days (CurrentDays of them) when they
-	// have enough samples, else of the whole range: the number a card leads with.
+	// Current is the median of the latest version with at least MinSamples
+	// samples, else of the latest with any. Verdict compares it with the first
+	// version with at least MinSamples, BaseVersion, and Change is the move as a
+	// fraction (-0.5 is half as slow), set when the verdict is faster or slower.
 	Current     float64
-	CurrentN    int
-	CurrentDays int
-	// Baseline is the median of the first days of the range. Change is how
-	// Current moved from it, as a fraction (-0.5 is half as slow), and is only
-	// there (HasChange) when both sides have MinDaySamples samples.
-	Baseline  float64
-	Change    float64
-	HasChange bool
-
-	Days    []DayPoint
-	Marks   []VersionMark
-	Phases  []PhaseStat
-	Slowest []perfstore.Entry
+	CurrentFrom string
+	BaseVersion string
+	Verdict     string
+	Change      float64
+	HasChange   bool
 }
-
-// edgeDays is how many days at each end of a range the change is measured on.
-func edgeDays(days int) int { return max(1, days/6) }
 
 // Summarize computes the card of op for f.
 func (m *Model) Summarize(op string, f Filter) Summary {
-	days := max(f.Days, 1)
-	r := m.Last(days, f.End)
-	q := Query{Op: op, Size: f.Size, R: r}
-	st := m.Stat(q, 10)
-	s := Summary{
-		Op: op, From: m.DayStart(r.From), To: m.DayStart(r.To + 1),
-		N: st.N, Errors: st.Errors, Cancelled: st.Cancelled,
-		P50: st.P50, P95: st.P95, P99: st.P99, Max: st.Max,
-		Phases: st.Phases, Slowest: st.Slowest,
+	versions := m.Versions()
+	if f.Last > 0 && len(versions) > f.Last {
+		versions = versions[len(versions)-f.Last:]
 	}
-	for d := r.From; d <= r.To; d++ {
-		dq := q
-		dq.R = Range{d, d}
-		vs := m.Values(dq)
-		p := DayPoint{Day: m.DayStart(d), N: len(vs)}
-		if len(vs) >= MinDaySamples {
-			p.P50, p.P95 = Percentile(vs, 50), Percentile(vs, 95)
-		} else {
-			p.Gap = true
+	s := Summary{Op: op, Verdict: VerdictThin}
+	var firstGood, lastGood *VersionPoint
+	for _, v := range versions {
+		st := m.Stat(Query{Op: op, Size: f.Size, Version: v.Version, R: AllTime}, 0)
+		s.Points = append(s.Points, VersionPoint{
+			Version: v.Version, First: v.First, N: st.N, P50: st.P50, P95: st.P95, Thin: st.N < MinSamples,
+		})
+	}
+	for i := range s.Points {
+		p := &s.Points[i]
+		if p.N == 0 {
+			continue
 		}
-		s.Days = append(s.Days, p)
-	}
-
-	edge := edgeDays(days)
-	cur := m.Values(Query{Op: op, Size: f.Size, R: Range{r.To - int32(edge) + 1, r.To}})
-	base := m.Values(Query{Op: op, Size: f.Size, R: Range{r.From, r.From + int32(edge) - 1}})
-	switch {
-	case len(cur) >= MinDaySamples:
-		s.Current, s.CurrentN, s.CurrentDays = Percentile(cur, 50), len(cur), edge
-	case st.N > 0:
-		s.Current, s.CurrentN, s.CurrentDays = st.P50, st.N, days
-	}
-	if len(base) >= MinDaySamples {
-		s.Baseline = Percentile(base, 50)
-		if len(cur) >= MinDaySamples && s.Baseline > 0 {
-			s.Change = (s.Current - s.Baseline) / s.Baseline
-			s.HasChange = true
+		s.Version = p.Version
+		if !p.Thin {
+			if firstGood == nil {
+				firstGood = p
+			}
+			lastGood = p
 		}
 	}
-	s.Marks = m.marks(s.From, s.To)
+	if s.Version == "" {
+		return s
+	}
+	st := m.Stat(Query{Op: op, Size: f.Size, Version: s.Version, R: AllTime}, 10)
+	s.N, s.Errors, s.Cancelled, s.Unseen = st.N, st.Errors, st.Cancelled, st.Unseen
+	s.P50, s.P95, s.P99, s.Max = st.P50, st.P95, st.P99, st.Max
+	s.Phases, s.Slowest = st.Phases, st.Slowest
+	s.Current, s.CurrentFrom = st.P50, s.Version
+	if lastGood != nil {
+		s.Current, s.CurrentFrom = lastGood.P50, lastGood.Version
+	}
+	if firstGood != nil && firstGood != lastGood {
+		s.BaseVersion = firstGood.Version
+		s.Verdict, s.Change = m.CompareVersions(op, f.Size, firstGood.Version, lastGood.Version)
+		s.HasChange = s.Verdict == VerdictFaster || s.Verdict == VerdictSlower
+	}
 	return s
 }
 
-// marks are the versions that first appeared inside [from, to), not counting
-// the oldest version of the data, which has nothing before it.
-func (m *Model) marks(from, to time.Time) []VersionMark {
-	vs := m.Versions()
-	var out []VersionMark
-	for i, v := range vs {
-		if i == 0 {
-			continue
-		}
-		if !v.First.Before(from) && v.First.Before(to) {
-			out = append(out, VersionMark{v.Version, v.First})
+// CompareVersions judges op on version later against version earlier. Over all
+// sizes it only speaks when both ran on the same one size: with a mix, a version
+// can look faster for having opened smaller repositories.
+func (m *Model) CompareVersions(op, size, earlier, later string) (string, float64) {
+	if size == "" {
+		a := m.BySize(Query{Op: op, Version: earlier, R: AllTime})
+		b := m.BySize(Query{Op: op, Version: later, R: AllTime})
+		if len(a) != 1 || len(b) != 1 || a[0].Key != b[0].Key {
+			return VerdictMixed, 0
 		}
 	}
-	return out
-}
-
-// Trend compares the median of the days up to end with the same number of days
-// before them.
-type Trend struct {
-	Now, Before          Stat
-	P50Change, P95Change float64
-	// Reliable is set when both periods have MinDaySamples samples.
-	Reliable bool
-}
-
-// TrendOf compares the period of days ending with the day of end against the
-// period of the same length before it.
-func (m *Model) TrendOf(q Query, days int, end time.Time) Trend {
-	days = max(days, 1)
-	endDay := m.Day(end)
-	q.R = Range{endDay - int32(days) + 1, endDay}
-	now := m.Stat(q, 0)
-	q.R = Range{endDay - int32(2*days) + 1, endDay - int32(days)}
-	before := m.Stat(q, 0)
-	t := Trend{Now: now, Before: before}
-	if now.N >= MinDaySamples && before.N >= MinDaySamples {
-		t.Reliable = true
-		if before.P50 > 0 {
-			t.P50Change = (now.P50 - before.P50) / before.P50
-		}
-		if before.P95 > 0 {
-			t.P95Change = (now.P95 - before.P95) / before.P95
-		}
-	}
-	return t
+	q := Query{Op: op, Size: size, R: AllTime}
+	q.Version = earlier
+	before := m.Values(q)
+	q.Version = later
+	return Judge(before, m.Values(q))
 }
 
 // SortSlowest orders entries slowest first, oldest first among equals.

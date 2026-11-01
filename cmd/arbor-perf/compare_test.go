@@ -400,8 +400,16 @@ func TestRecordCompareRoundTrip(t *testing.T) {
 	if code, out := runCmd("compare", "-input", write("alloc.txt", benchLines(1000, 11))); code != 1 || !strings.Contains(out, "ALLOC REGRESSION") {
 		t.Fatalf("alloc = %d\n%s", code, out)
 	}
-	// An improvement passes and tightens, so the old speed is now a regression.
-	if code, out := runCmd("compare", "-input", write("fast.txt", benchLines(500, 10))); code != 0 || !strings.Contains(out, "tightened") {
+	// An improvement moves nothing unless asked to: a lucky run must not become
+	// the yardstick.
+	if code, out := runCmd("compare", "-input", write("fast.txt", benchLines(500, 10))); code != 0 || strings.Contains(out, "tightened") {
+		t.Fatalf("improved without -update = %d\n%s", code, out)
+	}
+	if code, out := runCmd("compare", "-input", write("again.txt", benchLines(1000, 10))); code != 0 {
+		t.Fatalf("baseline moved without -update = %d\n%s", code, out)
+	}
+	// With -update it tightens, so the old speed is now a regression.
+	if code, out := runCmd("compare", "-update", "-input", write("fast.txt", benchLines(500, 10))); code != 0 || !strings.Contains(out, "tightened") {
 		t.Fatalf("fast = %d\n%s", code, out)
 	}
 	if code, out := runCmd("compare", "-input", write("old.txt", benchLines(1000, 10))); code != 1 {

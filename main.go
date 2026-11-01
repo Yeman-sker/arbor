@@ -1579,7 +1579,7 @@ func (a *app) repoFailed(dir string) {
 }
 
 func main() {
-	diag := newDiagnostics(sharedSettings(), userDataPath(), mygo.App.Version(), nativePrompts{})
+	diag := newDiagnostics(sharedSettings(), userDataPath(), buildVersion(mygo.App.Version()), nativePrompts{})
 	diag.newWindow = newPerfHostWindow
 	diag.Start()
 	beginStartup()

@@ -14,7 +14,7 @@ import (
 
 // Defaults of the store: how long and how much it keeps.
 const (
-	DefaultMaxAge   = 30 * 24 * time.Hour
+	DefaultMaxAge   = 365 * 24 * time.Hour // the climb is read across releases
 	DefaultMaxBytes = 100 << 20
 	// DefaultQueue is how many events wait for the writer. An event is about
 	// 140 bytes, so the queue is half a megabyte, and a burst beyond it is

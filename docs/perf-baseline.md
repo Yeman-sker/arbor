@@ -154,7 +154,7 @@ Over budget at this baseline (on this machine, under this load): `commit` on the
 
 ```sh
 go run ./cmd/arbor-perf record            # run the benchmarks, store this machine's baseline
-go run ./cmd/arbor-perf compare           # run again; exit 1 on a regression; tighten on improvement
+go run ./cmd/arbor-perf compare           # run again; exit 1 on a regression; -update tightens on improvement
 go run ./e2e                              # real-app scenarios (needs a desktop session)
 go run ./e2e -only 'startup|search' -sizes small
 ```

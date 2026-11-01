@@ -7,8 +7,11 @@ import (
 	"arbor/internal/perfstore"
 	"arbor/perf"
 	"fmt"
+	"maps"
 	"math"
 	"os"
+	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -18,24 +21,36 @@ import (
 	"github.com/egoist/mygo/ui/chart"
 )
 
-// The Performance window shows the climb: one chart per operation, with date
-// along x and duration up y from 0. Reading and aggregating runs off the UI
-// thread and publishes a finished set of cards.
+// The Performance window is where a person looks over the climb, which agents do
+// through arbor-perf. Real usage is one chart per operation, with the builds
+// along x, oldest first and evenly spaced, and duration up y from 0. Climb is what
+// each kept change did to its benchmarks, and every round tried. Reading and
+// aggregating runs off the UI thread and publishes a finished set of cards.
 
 const (
 	perfSourceUsage = iota
-	perfSourceBench
+	perfSourceClimb
 )
 
 // perfCardMinWidth decides how many cards fit in a row.
 const perfCardMinWidth = 340
 
-// trendPoint is one point of a chart: Mid is the line, Lo and Hi the band.
+// perfRanges are how many of the latest builds the window can cover; 0 is all.
+var (
+	perfRanges      = []int{5, 10, 0}
+	perfRangeLabels = []string{"Last 5", "Last 10", "All"}
+)
+
+// trendPoint is one build on a chart: Mid is the line, Lo and Hi the band. Label
+// is its version or short commit, and T when it ran, which only hover shows.
 type trendPoint struct {
+	Label       string
 	T           time.Time
 	Mid, Lo, Hi float64
 	N           int
-	Gap         bool
+	// Thin is a build with too few samples to judge, drawn hollow. Gap is one
+	// with none, which keeps its slot so the cards line up.
+	Thin, Gap bool
 }
 
 // trendCard is everything a card draws. It is built off the UI thread and only
@@ -43,14 +58,18 @@ type trendPoint struct {
 type trendCard struct {
 	Key, Title string
 	Budget     float64
+	// Current is the number on the card, measured on Build with N samples or runs.
 	Current    float64
 	HasCurrent bool
-	Change     float64
-	HasChange  bool
+	Build      string
 	N          int
-	From, To   time.Time
-	Points     []trendPoint
-	Marks      []perfagg.VersionMark
+	// Verdict says whether Current differs from build Base (perfagg.Judge), and
+	// Change by how much as a fraction, when HasChange.
+	Verdict   string
+	Change    float64
+	HasChange bool
+	Base      string
+	Points    []trendPoint
 	// Summary is there for real usage, and gives the detail view.
 	Summary *perfagg.Summary
 }
@@ -64,7 +83,7 @@ type perfView struct {
 	flush    func()
 
 	source int
-	days   int
+	last   int
 	size   string
 	detail string
 	hover  map[string]*int
@@ -75,10 +94,11 @@ type perfView struct {
 	loading bool
 	cards   []trendCard
 	info    string
+	rounds  []perfstore.Round // newest first, for the Climb source
 
-	mu     sync.Mutex // guards model and bench, which jobs share
+	mu     sync.Mutex // guards model and ledger, which jobs share
 	model  *perfagg.Model
-	bench  []perfstore.BenchRow
+	ledger []perfstore.Round
 	loaded bool
 
 	// Export preview.
@@ -91,7 +111,7 @@ type perfView struct {
 }
 
 func newPerfView(userData string) *perfView {
-	return &perfView{userData: userData, days: 30, now: time.Now, hover: map[string]*int{}}
+	return &perfView{userData: userData, last: 10, now: time.Now, hover: map[string]*int{}}
 }
 
 func (p *perfView) close() {
@@ -132,20 +152,20 @@ func (p *perfView) reload() {
 // rebuild makes the cards for the current choices.
 func (p *perfView) rebuild() {
 	p.seq++
-	seq, source, days, size, now := p.seq, p.source, p.days, p.size, p.now()
+	seq, source, last, size := p.seq, p.source, p.last, p.size
 	p.loading = true
 	p.run(func() func() {
-		cards, info := p.compute(source, days, size, now)
+		cards, info, rounds := p.compute(source, last, size)
 		return func() {
 			if seq != p.seq {
 				return
 			}
-			p.loading, p.cards, p.info = false, cards, info
+			p.loading, p.cards, p.info, p.rounds = false, cards, info, rounds
 		}
 	})
 }
 
-func (p *perfView) compute(source, days int, size string, now time.Time) ([]trendCard, string) {
+func (p *perfView) compute(source, last int, size string) ([]trendCard, string, []perfstore.Round) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if !p.loaded {
@@ -154,26 +174,32 @@ func (p *perfView) compute(source, days int, size string, now time.Time) ([]tren
 		}
 		p.model = perfagg.NewModel(time.Local)
 		_, _ = perfstore.ReadDir(perfstore.LogDir(p.userData), p.model.Add)
-		p.bench, _, _ = perfstore.ReadBench(perfstore.BenchDir(p.userData))
+		p.ledger, _ = perfstore.ReadRounds(filepath.Join(perfstore.BenchDir(p.userData), perfstore.RoundsFile))
 		p.loaded = true
 	}
-	if source == perfSourceBench {
-		return benchCards(p.bench, machine.Detect().Key, days, size, now)
+	if source == perfSourceClimb {
+		cards, info := climbCards(p.ledger, machine.Detect().Key, last, size)
+		rounds := slices.Clone(p.ledger)
+		slices.Reverse(rounds)
+		return cards, info, rounds
 	}
-	return usageCards(p.model, days, size, now), fmt.Sprintf("%d operations recorded", p.model.Events())
+	return usageCards(p.model, last, size), fmt.Sprintf("%d operations recorded", p.model.Events()), nil
 }
 
-// usageCards has one card per catalog operation.
-func usageCards(m *perfagg.Model, days int, size string, now time.Time) []trendCard {
+// usageCards has one card per catalog operation, with a slot per build.
+func usageCards(m *perfagg.Model, last int, size string) []trendCard {
 	var cards []trendCard
 	for _, op := range perf.Ops() {
-		s := m.Summarize(op.String(), perfagg.Filter{Size: size, Days: days, End: now})
+		s := m.Summarize(op.String(), perfagg.Filter{Size: size, Last: last})
 		c := trendCard{
-			Key: s.Op, Title: s.Op, Budget: op.BudgetMs(), N: s.N, From: s.From, To: s.To, Marks: s.Marks,
-			Current: s.Current, HasCurrent: s.N > 0, Change: s.Change, HasChange: s.HasChange, Summary: &s,
+			Key: s.Op, Title: s.Op, Budget: op.BudgetMs(), Current: s.Current, HasCurrent: s.N > 0, Build: s.CurrentFrom,
+			Verdict: s.Verdict, Change: s.Change, HasChange: s.HasChange, Base: s.BaseVersion, Summary: &s,
 		}
-		for _, d := range s.Days {
-			c.Points = append(c.Points, trendPoint{T: d.Day.Add(12 * time.Hour), Mid: d.P50, Lo: d.P50, Hi: d.P95, N: d.N, Gap: d.Gap})
+		for _, v := range s.Points {
+			c.Points = append(c.Points, trendPoint{Label: v.Version, T: v.First, Mid: v.P50, Lo: v.P50, Hi: v.P95, N: v.N, Thin: v.Thin, Gap: v.N == 0})
+			if v.Version == s.CurrentFrom {
+				c.N = v.N
+			}
 		}
 		cards = append(cards, c)
 	}
@@ -182,46 +208,72 @@ func usageCards(m *perfagg.Model, days int, size string, now time.Time) []trendC
 	return cards
 }
 
-// benchCards has one card per benchmark of this machine class.
-func benchCards(rows []perfstore.BenchRow, key string, days int, size string, now time.Time) ([]trendCard, string) {
-	from := now.AddDate(0, 0, -days)
-	byName := map[string][]perfstore.BenchRow{}
-	for _, r := range rows {
-		if r.Machine != key || r.T.Before(from) || (size != "" && !strings.HasSuffix(r.Name, "/"+size)) {
+// climbCards has one card per benchmark a kept change moved, on this machine
+// class: where it started and then where each kept change left it.
+func climbCards(rounds []perfstore.Round, key string, last int, size string) ([]trendCard, string) {
+	byName := map[string][]trendPoint{}
+	kept, tried := 0, 0
+	for _, r := range rounds {
+		if r.Kind != perfstore.RoundTry {
 			continue
 		}
-		byName[r.Name] = append(byName[r.Name], r)
-	}
-	names := make([]string, 0, len(byName))
-	for n := range byName {
-		names = append(names, n)
-	}
-	sort.Strings(names)
-	var cards []trendCard
-	for _, n := range names {
-		rs := byName[n]
-		sort.SliceStable(rs, func(i, j int) bool { return rs[i].T.Before(rs[j].T) })
-		c := trendCard{Key: n, Title: n, N: len(rs), From: from, To: now, HasCurrent: true}
-		last := rs[len(rs)-1]
-		c.Current = last.Ns / 1e6
-		if first := rs[0]; len(rs) > 1 && first.Ns > 0 {
-			c.Change, c.HasChange = (last.Ns-first.Ns)/first.Ns, true
+		tried++
+		if r.Verdict != perfstore.VerdictKeep || r.Machine != key {
+			continue
 		}
-		version := rs[0].Version
-		for _, r := range rs {
-			lo, hi := r.MinNs, r.MaxNs
-			if lo == 0 || hi == 0 {
-				lo, hi = r.Ns, r.Ns
+		kept++
+		for _, b := range r.Target {
+			if size != "" && !strings.HasSuffix(b.Name, "/"+size) {
+				continue
 			}
-			c.Points = append(c.Points, trendPoint{T: r.T, Mid: r.Ns / 1e6, Lo: lo / 1e6, Hi: hi / 1e6, N: r.Runs})
-			if r.Version != version && r.Version != "" {
-				c.Marks = append(c.Marks, perfagg.VersionMark{Version: r.Version, At: r.T})
-				version = r.Version
+			if byName[b.Name] == nil {
+				byName[b.Name] = []trendPoint{benchPoint(r.Base, r.T, b.BaseNs)}
 			}
+			byName[b.Name] = append(byName[b.Name], benchPoint(r.Commit, r.T, b.CurNs))
+		}
+	}
+	var cards []trendCard
+	for _, n := range slices.Sorted(maps.Keys(byName)) {
+		pts := byName[n]
+		if last > 0 && len(pts) > last {
+			pts = pts[len(pts)-last:]
+		}
+		first, newest := pts[0], pts[len(pts)-1]
+		c := trendCard{Key: n, Title: n, Current: newest.Mid, HasCurrent: true, Build: newest.Label, N: len(pts) - 1, Points: pts}
+		if first.Mid > 0 {
+			c.Change, c.HasChange, c.Base = (newest.Mid-first.Mid)/first.Mid, true, first.Label
 		}
 		cards = append(cards, c)
 	}
-	return cards, fmt.Sprintf("%d benchmarks on %s", len(cards), key)
+	return cards, fmt.Sprintf("%d kept of %d rounds", kept, tried)
+}
+
+func benchPoint(commit string, t time.Time, ns float64) trendPoint {
+	return trendPoint{Label: commit, T: t, Mid: ns / 1e6, Lo: ns / 1e6, Hi: ns / 1e6}
+}
+
+// buildTicks labels the slots along the bottom, as many as fit in width at
+// the longest label, always with the newest.
+func buildTicks(points []trendPoint, width float32) []chart.Tick {
+	// A build with uncommitted changes takes less room as commit*.
+	short := func(label string) string { return strings.Replace(label, "+dirty", "*", 1) }
+	longest := 1
+	for _, pt := range points {
+		longest = max(longest, len(short(pt.Label)))
+	}
+	fit := max(1, int(width/float32(longest*6+12)))
+	step := max(1, (len(points)+fit-1)/fit)
+	var ticks []chart.Tick
+	for i := len(points) - 1; i >= 0; i -= step {
+		ticks = append(ticks, chart.Tick{At: slotX(i, len(points)), Label: short(points[i].Label)})
+	}
+	slices.Reverse(ticks)
+	return ticks
+}
+
+// slotX is the middle of slot i of n, so the slots are evenly spaced.
+func slotX(i, n int) float32 {
+	return (float32(i) + 0.5) / float32(n)
 }
 
 func fmtMs(v float64) string {
@@ -289,19 +341,12 @@ func (p *perfView) header(c *ui.Context, t *ui.Theme) {
 			ui.Text(c, p.info).FontSize(11.5).TextColor(t.TextMuted).SingleLine()
 		})
 		ui.Spacer(c)
-		perfChips(c, t, "perf-source", []string{"Real usage", "Benchmarks"}, p.source, func(i int) {
+		perfChips(c, t, "perf-source", []string{"Real usage", "Climb"}, p.source, func(i int) {
 			p.source, p.detail = i, ""
 			p.rebuild()
 		})
-		ranges := []int{7, 30, 90}
-		on := 1
-		for i, d := range ranges {
-			if d == p.days {
-				on = i
-			}
-		}
-		perfChips(c, t, "perf-range", []string{"7d", "30d", "90d"}, on, func(i int) {
-			p.days = ranges[i]
+		perfChips(c, t, "perf-range", perfRangeLabels, slices.Index(perfRanges, p.last), func(i int) {
+			p.last = perfRanges[i]
 			p.rebuild()
 		})
 		sizes := []string{"", "small", "medium", "large"}
@@ -324,14 +369,14 @@ func (p *perfView) header(c *ui.Context, t *ui.Theme) {
 func (p *perfView) grid(c *ui.Context, t *ui.Theme) {
 	w, _ := c.Size()
 	cols := max(1, int((w-40+12)/(perfCardMinWidth+12)))
-	if len(p.cards) == 0 {
+	if len(p.cards) == 0 && len(p.rounds) == 0 {
 		ui.Column(c).Grow(1).FillWidth().Center().Gap(6).Children(func() {
 			switch {
 			case p.loading:
 				ui.Text(c, "Loading…").TextColor(t.TextMuted)
-			case p.source == perfSourceBench:
-				ui.Text(c, "No benchmark history in this range").FontWeight(500)
-				ui.Text(c, "Run: go run ./cmd/arbor-perf record").FontSize(12).TextColor(t.TextMuted).Font("monospace").Selectable()
+			case p.source == perfSourceClimb:
+				ui.Text(c, "No rounds yet").FontWeight(500)
+				ui.Text(c, "An agent starts with: go run ./cmd/arbor-perf climb next").FontSize(12).TextColor(t.TextMuted).Font("monospace").Selectable()
 			default:
 				ui.Text(c, "No performance data yet").FontWeight(500)
 			}
@@ -341,7 +386,7 @@ func (p *perfView) grid(c *ui.Context, t *ui.Theme) {
 	ui.Scroll(c).Grow(1).FillWidth().MinHeight(0).Children(func() {
 		ui.Column(c).Padding(16, 20).Gap(12).FillWidth().Children(func() {
 			if p.source == perfSourceUsage && p.total() == 0 && !p.loading {
-				ui.Text(c, "No operations recorded in this range yet. Use Arbor for a while and they will appear here.").TextColor(t.TextMuted)
+				ui.Text(c, "No operations recorded on these versions yet. Use Arbor for a while and they will appear here.").TextColor(t.TextMuted)
 			}
 			for i := 0; i < len(p.cards); i += cols {
 				ui.Row(c).Gap(12).FillWidth().Children(func() {
@@ -354,7 +399,39 @@ func (p *perfView) grid(c *ui.Context, t *ui.Theme) {
 					}
 				})
 			}
+			if len(p.rounds) > 0 {
+				p.roundList(c, t)
+			}
 		})
+	})
+}
+
+// roundList is every round tried, newest first: what was tried, and what came of
+// it, including what was thrown away.
+func (p *perfView) roundList(c *ui.Context, t *ui.Theme) {
+	ui.Column(c).Gap(8).FillWidth().Padding(8, 0, 0, 0).Children(func() {
+		ui.Text(c, "Rounds").FontWeight(600)
+		for _, r := range p.rounds {
+			outcome := r.Verdict
+			if r.Kind != perfstore.RoundTry {
+				outcome = r.Kind
+			} else if r.Reason != "" {
+				outcome += " · " + strings.ReplaceAll(r.Reason, "_", " ")
+			}
+			col := t.TextMuted
+			switch r.Verdict {
+			case perfstore.VerdictKeep:
+				col = t.Success
+			case perfstore.VerdictRevert:
+				col = t.Danger
+			}
+			ui.Row(c).Gap(12).AlignItems(ui.Center).FillWidth().Children(func() {
+				ui.Text(c, r.T.Local().Format("Jan 2")).Width(44).Shrink(0).FontSize(12).TextColor(t.TextMuted)
+				ui.Text(c, r.Op).Width(130).Shrink(0).FontSize(12).SingleLine()
+				ui.Text(c, outcome).Width(240).Shrink(0).FontSize(12).TextColor(col).SingleLine()
+				ui.Text(c, r.Note).FontSize(12).TextColor(t.TextMuted).Shrink(1).MinWidth(0).SingleLine()
+			})
+		}
 	})
 }
 
@@ -387,7 +464,7 @@ func (p *perfView) card(c *ui.Context, t *ui.Theme, tc *trendCard) {
 	}
 	card.Children(func() {
 		p.cardHeader(c, t, tc)
-		p.chart(c, t, tc, 120)
+		p.chart(c, t, tc, 120, perfCardMinWidth-70)
 	})
 }
 
@@ -395,14 +472,8 @@ func (p *perfView) cardHeader(c *ui.Context, t *ui.Theme, tc *trendCard) {
 	ui.Row(c).Gap(6).AlignItems(ui.Center).Children(func() {
 		ui.Text(c, tc.Title).FontSize(12.5).FontWeight(500).SingleLine().Shrink(1).MinWidth(0)
 		ui.Spacer(c)
-		if tc.HasChange {
-			col := t.TextMuted
-			if tc.Change <= -0.02 {
-				col = t.Success
-			} else if tc.Change >= 0.02 {
-				col = t.Danger
-			}
-			ui.Text(c, fmtChange(tc.Change)).FontSize(11.5).TextColor(col)
+		if text, col := changeText(t, tc); text != "" {
+			ui.Text(c, text).FontSize(11.5).TextColor(col).NoWrap()
 		}
 		if tc.HasCurrent {
 			ui.Text(c, fmtMs(tc.Current)).FontSize(14).FontWeight(600)
@@ -415,34 +486,53 @@ func (p *perfView) cardHeader(c *ui.Context, t *ui.Theme, tc *trendCard) {
 	switch {
 	case *sel >= 0 && *sel < len(tc.Points):
 		pt := tc.Points[*sel]
-		line = pt.T.Format("Jan 2")
-		if pt.Gap {
-			line += fmt.Sprintf(" · %d samples, too few to draw", pt.N)
-		} else if tc.Summary != nil {
-			line += fmt.Sprintf(" · p50 %s · p95 %s · %d samples", fmtMs(pt.Mid), fmtMs(pt.Hi), pt.N)
-		} else {
-			line += fmt.Sprintf(" · %s · %s to %s", fmtMs(pt.Mid), fmtMs(pt.Lo), fmtMs(pt.Hi))
+		line = pt.Label
+		switch {
+		case pt.Gap:
+			line += " · No samples"
+		case tc.Summary != nil:
+			line += fmt.Sprintf(" · since %s · p50 %s · p95 %s · %d samples", pt.T.Local().Format("Jan 2"), fmtMs(pt.Mid), fmtMs(pt.Hi), pt.N)
+			if pt.Thin {
+				line += ", too few to judge"
+			}
+		default:
+			line += fmt.Sprintf(" · %s · %s · %s to %s", pt.T.Local().Format("Jan 2"), fmtMs(pt.Mid), fmtMs(pt.Lo), fmtMs(pt.Hi))
 		}
-	case tc.N == 0:
+	case !tc.HasCurrent:
 		line = "No data"
 	case tc.Budget > 0 && tc.Current > tc.Budget:
-		line = fmt.Sprintf("Over the %s budget · %d samples", fmtMs(tc.Budget), tc.N)
+		line = fmt.Sprintf("Over the %s budget · %d samples on %s", fmtMs(tc.Budget), tc.N, tc.Build)
 		col = t.Danger
 	case tc.Budget > 0:
-		line = fmt.Sprintf("Within the %s budget · %d samples", fmtMs(tc.Budget), tc.N)
+		line = fmt.Sprintf("Within the %s budget · %d samples on %s", fmtMs(tc.Budget), tc.N, tc.Build)
 	default:
-		line = fmt.Sprintf("%d runs", tc.N)
+		line = fmt.Sprintf("%d kept changes, now at %s", tc.N, tc.Build)
 	}
 	ui.Text(c, line).FontSize(11).TextColor(col).SingleLine()
 }
 
-// chart draws a card's trend. Days with too few samples leave gaps in the line.
-func (p *perfView) chart(c *ui.Context, t *ui.Theme, tc *trendCard, height float32) {
-	from, to := tc.From, tc.To
-	if !to.After(from) {
-		to = from.Add(time.Hour)
+// changeText says how the card's number compares with its earlier build. It stays
+// quiet unless the difference can be told from noise, and a log cannot show that
+// across repository sizes.
+func changeText(t *ui.Theme, tc *trendCard) (string, ui.Color) {
+	switch {
+	case tc.Base == "":
+		return "", t.TextMuted
+	case tc.Verdict == perfagg.VerdictMixed:
+		return "Pick a size to compare", t.TextMuted
+	case tc.Verdict == perfagg.VerdictFlat:
+		return "No clear change since " + tc.Base, t.TextMuted
+	case !tc.HasChange:
+		return "", t.TextMuted
+	case tc.Change < 0:
+		return fmtChange(tc.Change) + " since " + tc.Base, t.Success
 	}
-	x := chart.NewTime(from, to)
+	return fmtChange(tc.Change) + " since " + tc.Base, t.Danger
+}
+
+// chart draws a card's trend over its builds. Builds with no samples leave gaps
+// in the line; width is about how much room the bottom labels have.
+func (p *perfView) chart(c *ui.Context, t *ui.Theme, tc *trendCard, height, width float32) {
 	top := tc.Budget
 	for _, pt := range tc.Points {
 		if !pt.Gap && pt.Hi > top {
@@ -455,8 +545,8 @@ func (p *perfView) chart(c *ui.Context, t *ui.Theme, tc *trendCard, height float
 	y := chart.NewLinear(0, top*1.1).Nice(3)
 	ticks := y.Ticks(3)
 	xs := make([]float32, len(tc.Points))
-	for i, pt := range tc.Points {
-		xs[i] = x.At(pt.T)
+	for i := range tc.Points {
+		xs[i] = slotX(i, len(tc.Points))
 	}
 	type run struct{ xs, mid, lo, hi []float32 }
 	var runs []run
@@ -480,26 +570,23 @@ func (p *perfView) chart(c *ui.Context, t *ui.Theme, tc *trendCard, height float
 	if tc.Budget > 0 {
 		budget = y.At(tc.Budget)
 	}
-	type mark struct {
-		x     float32
-		label string
+	type dot struct {
+		x, y float32
+		thin bool
 	}
-	var marks []mark
-	for _, m := range tc.Marks {
-		marks = append(marks, mark{x.At(m.At), m.Version})
+	var dots []dot
+	for i, pt := range tc.Points {
+		if !pt.Gap {
+			dots = append(dots, dot{xs[i], y.At(pt.Mid), pt.Thin})
+		}
 	}
-	line, grid, muted, warn := t.Accent, t.Border, t.TextMuted, t.Warning
+	line, grid, warn, surface := t.Accent, t.Border, t.Warning, t.Surface
 	label := func(_ chart.Side, tk chart.Tick) { ui.Text(c, tk.Label).FontSize(10).TextColor(t.TextMuted).NoWrap() }
-	chart.Plot(c, chart.Axes{Left: ticks, Bottom: x.Ticks(3), Label: label}, func(area ui.Element) {
+	chart.Plot(c, chart.Axes{Left: ticks, Bottom: buildTicks(tc.Points, width), Label: label}, func(area ui.Element) {
 		area.Draw(func(pn *ui.Painter, r ui.Rect) {
 			for _, tk := range ticks {
 				gy := chart.Y(r, tk.At)
 				pn.Line(r.X, gy, r.X+r.W, gy, 1, grid)
-			}
-			for _, m := range marks {
-				mx := chart.X(r, m.x)
-				pn.Line(mx, r.Y, mx, r.Y+r.H, 1, muted.Alpha(0.5))
-				pn.Text(mx+3, r.Y+1, m.label, 10, muted)
 			}
 			if budget >= 0 {
 				by := float32(math.Round(float64(chart.Y(r, budget))))
@@ -509,19 +596,30 @@ func (p *perfView) chart(c *ui.Context, t *ui.Theme, tc *trendCard, height float
 			}
 			for _, rn := range runs {
 				if len(rn.xs) == 1 {
-					cx, cy := chart.X(r, rn.xs[0]), chart.Y(r, rn.mid[0])
+					cx := chart.X(r, rn.xs[0])
 					pn.Line(cx, chart.Y(r, rn.lo[0]), cx, chart.Y(r, rn.hi[0]), 2, line.Alpha(0.2))
-					pn.Fill(ui.Rect{X: cx - 2, Y: cy - 2, W: 4, H: 4}, line, 2)
 					continue
 				}
 				pn.FillPath(chart.Area(r, rn.xs, rn.lo, rn.hi, chart.CurveLinear), line.Alpha(0.16))
 				pn.StrokePath(chart.Line(r, rn.xs, rn.mid, chart.CurveLinear), 1.5, line)
 			}
+			// Each build is a thing of its own, so show it while there is room.
+			if r.W >= float32(len(xs))*8 {
+				for _, d := range dots {
+					at := ui.Rect{X: chart.X(r, d.x) - 3, Y: chart.Y(r, d.y) - 3, W: 6, H: 6}
+					if d.thin {
+						pn.Fill(at, surface, 3)
+						pn.Stroke(at, line, 3, 1.25)
+					} else {
+						pn.Fill(at, line, 3)
+					}
+				}
+			}
 		})
 		sel := p.selection(tc.Key)
 		if len(xs) > 0 {
 			chart.Select(c, area, sel, xs, func(i int) string {
-				return tc.Points[i].T.Format("Jan 2") + " " + fmtMs(tc.Points[i].Mid)
+				return tc.Points[i].Label + " " + fmtMs(tc.Points[i].Mid)
 			})
 			if !area.Hovered() {
 				*sel = -1
@@ -556,7 +654,11 @@ func (p *perfView) detailView(c *ui.Context, t *ui.Theme) {
 				}
 			})
 			p.cardHeader(c, t, tc)
-			p.chart(c, t, tc, 240)
+			w, _ := c.Size()
+			p.chart(c, t, tc, 240, w-90)
+			if s.N > 0 {
+				ui.Text(c, "On "+s.Version).FontWeight(600)
+			}
 			ui.Row(c).Gap(24).Wrap().Children(func() {
 				stat := func(name, value string) {
 					ui.Column(c).Gap(1).Children(func() {
@@ -571,6 +673,7 @@ func (p *perfView) detailView(c *ui.Context, t *ui.Theme) {
 				stat("Samples", fmt.Sprint(s.N))
 				stat("Errors", fmt.Sprint(s.Errors))
 				stat("Cancelled", fmt.Sprint(s.Cancelled))
+				stat("Unseen", fmt.Sprint(s.Unseen))
 			})
 			if len(s.Phases) > 0 {
 				ui.Column(c).Gap(6).FillWidth().Children(func() {
@@ -597,7 +700,7 @@ func (p *perfView) detailView(c *ui.Context, t *ui.Theme) {
 						ui.Row(c).Gap(12).Children(func() {
 							ui.Text(c, fmtMs(e.Ms)).Width(70).Shrink(0).FontSize(12).FontWeight(500)
 							ui.Text(c, e.T.In(time.Local).Format("Jan 2 15:04")).Width(90).Shrink(0).FontSize(12).TextColor(t.TextMuted)
-							ui.Text(c, e.Size+" · v"+e.Version).Width(110).Shrink(0).FontSize(12).TextColor(t.TextMuted)
+							ui.Text(c, e.Size).Width(60).Shrink(0).FontSize(12).TextColor(t.TextMuted)
 							ui.Text(c, strings.Join(parts, " · ")).FontSize(12).TextColor(t.TextMuted).Shrink(1).MinWidth(0)
 						})
 					}

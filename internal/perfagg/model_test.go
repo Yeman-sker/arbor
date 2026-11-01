@@ -153,114 +153,6 @@ func TestPhasesAndTheirShare(t *testing.T) {
 }
 
 // A week of data with a day too thin to draw, a new version, and a speed-up.
-func climbModel() (*Model, time.Time) {
-	m := NewModel(utc)
-	now := at(31, 12)
-	for back := 29; back >= 0; back-- {
-		day := now.AddDate(0, 0, -back)
-		version := "0.1.0"
-		ms := 100.0
-		if back < 15 {
-			version = "0.2.0"
-			ms = 50
-		}
-		n := 20
-		if back == 10 {
-			n = 3 // too few samples: a gap
-		}
-		for i := 0; i < n; i++ {
-			m.Add(entry("open_file", day.Add(time.Duration(i)*time.Minute), ms+float64(i), "ok", "large", version))
-		}
-	}
-	return m, now
-}
-
-func TestSummarizeGapsChangeAndMarks(t *testing.T) {
-	m, now := climbModel()
-	s := m.Summarize("open_file", Filter{Days: 30, End: now})
-	if len(s.Days) != 30 || !s.From.Equal(at(2, 0)) || !s.To.Equal(at(1, 0).AddDate(0, 1, 0)) {
-		t.Fatalf("range: %d days from %v to %v", len(s.Days), s.From, s.To)
-	}
-	gaps := 0
-	for i, d := range s.Days {
-		if d.Gap {
-			gaps++
-			if d.N != 3 || i != 19 {
-				t.Errorf("gap at index %d with %d samples", i, d.N)
-			}
-			if d.P50 != 0 || d.P95 != 0 {
-				t.Errorf("a gap carries numbers: %+v", d)
-			}
-		} else if d.N != 20 {
-			t.Errorf("day %d has %d samples", i, d.N)
-		}
-	}
-	if gaps != 1 {
-		t.Fatalf("%d gaps, want 1", gaps)
-	}
-	// The first five days are 100..119 ms (median of 20 values: rank 10 = 109),
-	// the last five 50..69 (rank 10 = 59).
-	if s.Baseline != 109 || s.Current != 59 || s.CurrentDays != 5 || !s.HasChange {
-		t.Fatalf("baseline=%v current=%v days=%d change=%v", s.Baseline, s.Current, s.CurrentDays, s.HasChange)
-	}
-	if want := (59.0 - 109.0) / 109.0; math.Abs(s.Change-want) > 1e-9 {
-		t.Fatalf("change = %v, want %v", s.Change, want)
-	}
-	if len(s.Marks) != 1 || s.Marks[0].Version != "0.2.0" || !s.Marks[0].At.Equal(at(17, 12)) {
-		t.Fatalf("marks = %+v", s.Marks)
-	}
-	if s.N != 29*20+3 || s.P50 == 0 || s.P95 < s.P50 || s.Max != 119 {
-		t.Fatalf("totals: N=%d p50=%v p95=%v max=%v", s.N, s.P50, s.P95, s.Max)
-	}
-	if len(s.Slowest) == 0 || s.Slowest[0].Ms != 119 {
-		t.Fatalf("slowest = %+v", s.Slowest)
-	}
-	// A narrower range keeps no mark that is outside it, and the first version has none.
-	w := m.Summarize("open_file", Filter{Days: 7, End: now})
-	if len(w.Days) != 7 || len(w.Marks) != 0 {
-		t.Fatalf("7 days: %d days, marks %+v", len(w.Days), w.Marks)
-	}
-	// Sizes filter.
-	if none := m.Summarize("open_file", Filter{Days: 30, End: now, Size: "small"}); none.N != 0 || none.HasChange || none.Current != 0 {
-		t.Fatalf("small = %+v", none)
-	}
-}
-
-func TestSummaryChangeNeedsEnoughSamplesOnBothSides(t *testing.T) {
-	m := NewModel(utc)
-	now := at(31, 12)
-	for i := 0; i < 4; i++ { // four samples at the start: too few
-		m.Add(entry("search", at(2, i), 40, "ok", "small", "1"))
-	}
-	for d := 20; d <= 31; d++ {
-		for i := 0; i < 6; i++ {
-			m.Add(entry("search", at(d, i), 20, "ok", "small", "1"))
-		}
-	}
-	s := m.Summarize("search", Filter{Days: 30, End: now})
-	if s.HasChange || s.Baseline != 0 || s.Current != 20 {
-		t.Fatalf("summary = baseline %v current %v change %v has=%v", s.Baseline, s.Current, s.Change, s.HasChange)
-	}
-	// Too thin everywhere: the headline falls back to the whole range, or to nothing.
-	thin := NewModel(utc)
-	for d := 28; d <= 31; d++ {
-		thin.Add(entry("search", at(d, 1), float64(d), "ok", "small", "1"))
-	}
-	ts := thin.Summarize("search", Filter{Days: 30, End: now})
-	if ts.CurrentDays != 30 || ts.Current != 29 || ts.HasChange {
-		t.Fatalf("thin: current=%v over %d days has=%v", ts.Current, ts.CurrentDays, ts.HasChange)
-	}
-	for _, d := range ts.Days {
-		if !d.Gap {
-			t.Fatalf("a day with one sample is drawn: %+v", d)
-		}
-	}
-	empty := NewModel(nil).Summarize("search", Filter{Days: 30, End: now})
-	if empty.N != 0 || len(empty.Days) != 30 || empty.Current != 0 {
-		t.Fatalf("empty = %+v", empty)
-	}
-}
-
 func TestDaysAreCalendarDaysOfTheLocation(t *testing.T) {
 	tokyo := time.FixedZone("JST", 9*3600)
 	m := NewModel(tokyo)
@@ -275,28 +167,6 @@ func TestDaysAreCalendarDaysOfTheLocation(t *testing.T) {
 	}
 	if m.DayStart(m.Day(e.T)+1).Sub(m.DayStart(m.Day(e.T))) != 24*time.Hour {
 		t.Fatal("a day is not 24 hours")
-	}
-}
-
-func TestTrendComparesThePeriodWithTheOneBefore(t *testing.T) {
-	m := NewModel(utc)
-	now := at(31, 12)
-	for back := 0; back < 14; back++ {
-		ms := 200.0
-		if back < 7 {
-			ms = 100
-		}
-		for i := 0; i < 3; i++ {
-			m.Add(entry("commit", now.AddDate(0, 0, -back).Add(time.Duration(i)*time.Minute), ms, "ok", "large", "1"))
-		}
-	}
-	tr := m.TrendOf(Query{Op: "commit"}, 7, now)
-	if !tr.Reliable || tr.Now.N != 21 || tr.Before.N != 21 || math.Abs(tr.P50Change-(-0.5)) > 1e-9 {
-		t.Fatalf("trend = %+v", tr)
-	}
-	thin := m.TrendOf(Query{Op: "commit"}, 1, now) // three samples a day: too few
-	if thin.Reliable {
-		t.Fatalf("a trend of 3 against 3 samples is called reliable: %+v", thin)
 	}
 }
 
@@ -316,5 +186,157 @@ func TestSlowestKeepsTheTopOfEachDayAndIsBounded(t *testing.T) {
 	}
 	if st.Slowest[0].Ms != 499 {
 		t.Fatalf("slowest = %v", st.Slowest[0].Ms)
+	}
+}
+
+// climbModel has three versions getting faster, on days far apart: time plays
+// no part in the summary. Runs vary around each median, as real ones do.
+func climbModel() *Model {
+	m := NewModel(utc)
+	for _, v := range []struct {
+		version string
+		ms      float64
+		month   time.Month
+	}{{"0.1.0", 400, 1}, {"0.2.0", 200, 6}, {"0.3.0", 100, 12}} {
+		for s := range 30 {
+			t := time.Date(2026, v.month, 1, 0, s, 0, 0, utc)
+			ms := v.ms * (0.95 + 0.1*float64(s)/29)
+			m.Add(entry("open_file", t, ms, "ok", "small", v.version, perfstore.PhaseMs{Name: "load_file", Ms: ms}))
+		}
+	}
+	return m
+}
+
+func TestSummarizeIsAPointPerVersion(t *testing.T) {
+	m := climbModel()
+	s := m.Summarize("open_file", Filter{Size: "small"})
+	if len(s.Points) != 3 || s.Points[0].Version != "0.1.0" || s.Points[2].Version != "0.3.0" {
+		t.Fatalf("points = %+v", s.Points)
+	}
+	if s.Points[1].N != 30 || s.Points[1].Thin {
+		t.Fatalf("0.2.0 = %+v", s.Points[1])
+	}
+	if s.Version != "0.3.0" || s.BaseVersion != "0.1.0" || s.Verdict != VerdictFaster || !s.HasChange || s.Change > -0.7 || s.Change < -0.8 {
+		t.Fatalf("summary = %+v", s)
+	}
+	if s.N != 30 || len(s.Phases) != 1 || len(s.Slowest) == 0 || s.Slowest[0].Version != "0.3.0" {
+		t.Fatalf("the detail is not of the latest version: %+v", s)
+	}
+	last := m.Summarize("open_file", Filter{Size: "small", Last: 2})
+	if len(last.Points) != 2 || last.BaseVersion != "0.2.0" || last.Verdict != VerdictFaster {
+		t.Fatalf("last 2 = %+v", last)
+	}
+	if none := m.Summarize("open_file", Filter{Size: "large"}); none.N != 0 || none.Version != "" || none.HasChange || len(none.Points) != 3 || none.Points[0].N != 0 {
+		t.Fatalf("other size = %+v", none)
+	}
+}
+
+func TestSummaryOnlyComparesVersionsWithEnoughSamples(t *testing.T) {
+	m := NewModel(utc)
+	for i := range 19 { // too few to judge
+		m.Add(entry("search", at(2, 0).Add(time.Duration(i)*time.Minute), 40, "ok", "small", "1"))
+	}
+	for i := range 25 {
+		m.Add(entry("search", at(3, 0).Add(time.Duration(i)*time.Minute), 20, "ok", "small", "2"))
+	}
+	for i := range 2 { // the latest, but too few to lead with
+		m.Add(entry("search", at(4, i), 90, "ok", "small", "3"))
+	}
+	s := m.Summarize("search", Filter{})
+	if !s.Points[0].Thin || s.Points[1].Thin || !s.Points[2].Thin {
+		t.Fatalf("points = %+v", s.Points)
+	}
+	if s.HasChange || s.Verdict != VerdictThin || s.Current != 20 || s.CurrentFrom != "2" || s.Version != "3" {
+		t.Fatalf("summary = %+v", s)
+	}
+	thin := NewModel(utc)
+	thin.Add(entry("search", at(2, 1), 7, "ok", "small", "1"))
+	ts := thin.Summarize("search", Filter{})
+	if ts.Current != 7 || ts.CurrentFrom != "1" || ts.HasChange {
+		t.Fatalf("thin = %+v", ts)
+	}
+	if empty := NewModel(nil).Summarize("search", Filter{}); empty.N != 0 || len(empty.Points) != 0 || empty.Current != 0 {
+		t.Fatalf("empty = %+v", empty)
+	}
+}
+
+// A newer version that only ran on small repositories must not read as faster
+// than an older one that ran on large ones.
+func TestMixedSizesGetNoVerdict(t *testing.T) {
+	m := NewModel(utc)
+	for i := range 30 {
+		m.Add(entry("search", at(2, 0).Add(time.Duration(i)*time.Minute), 400, "ok", "large", "1"))
+		m.Add(entry("search", at(3, 0).Add(time.Duration(i)*time.Minute), 20, "ok", "small", "2"))
+	}
+	if s := m.Summarize("search", Filter{}); s.Verdict != VerdictMixed || s.HasChange {
+		t.Fatalf("summary = %+v", s)
+	}
+	if v, _ := m.CompareVersions("search", "large", "1", "2"); v != VerdictThin {
+		t.Fatalf("one size with no data on one side = %s", v)
+	}
+}
+
+func TestMedianCI(t *testing.T) {
+	seq := func(n int) []float64 {
+		out := make([]float64, n)
+		for i := range out {
+			out[i] = float64(i + 1)
+		}
+		return out
+	}
+	if _, _, ok := MedianCI(seq(5)); ok {
+		t.Fatal("5 values cannot give a 95% interval")
+	}
+	// From published tables of order statistics for the median.
+	for _, c := range []struct {
+		n      int
+		lo, hi float64
+	}{{6, 1, 6}, {9, 2, 8}, {20, 6, 15}, {100, 40, 61}} {
+		lo, hi, ok := MedianCI(seq(c.n))
+		if !ok || lo != c.lo || hi != c.hi {
+			t.Errorf("n=%d: [%v, %v], want [%v, %v]", c.n, lo, hi, c.lo, c.hi)
+		}
+	}
+	if lo, hi, ok := MedianCI(seq(10000)); !ok || lo > 4905 || lo < 4895 || hi < 5095 || hi > 5106 {
+		t.Errorf("n=10000: [%v, %v]", lo, hi)
+	}
+}
+
+func TestJudgeNeedsARealDifference(t *testing.T) {
+	spread := func(mid, width float64) []float64 {
+		out := make([]float64, 40)
+		for i := range out {
+			out[i] = mid - width + 2*width*float64(i)/39
+		}
+		return out
+	}
+	if v, c := Judge(spread(100, 5), spread(50, 5)); v != VerdictFaster || c > -0.45 {
+		t.Fatalf("%s %v", v, c)
+	}
+	if v, _ := Judge(spread(50, 5), spread(100, 5)); v != VerdictSlower {
+		t.Fatal(v)
+	}
+	if v, _ := Judge(spread(100, 90), spread(80, 90)); v != VerdictFlat {
+		t.Fatalf("wide runs: %s", v)
+	}
+	// Precise runs, but too small a change to act on.
+	if v, _ := Judge(spread(100, 1), spread(98, 1)); v != VerdictFlat {
+		t.Fatalf("small change: %s", v)
+	}
+	if v, _ := Judge(spread(100, 1)[:19], spread(10, 1)); v != VerdictThin {
+		t.Fatal(v)
+	}
+}
+
+func TestUnexplainedAndUnseenAreCounted(t *testing.T) {
+	m := NewModel(utc)
+	m.Add(entry("x", at(2, 0), 320000, "ok", "small", "1", perfstore.PhaseMs{Name: "git_status", Ms: 30}))
+	m.Add(entry("x", at(2, 1), 100, "ok", "small", "1", perfstore.PhaseMs{Name: "git_status", Ms: 90}))
+	m.Add(entry("x", at(2, 2), 4, "ok", "small", "1"))
+	m.Add(entry("x", at(2, 3), 60, "ok", "small", "1"))
+	m.Add(entry("x", at(2, 4), 60, perfstore.ResultUnseen, "small", "1"))
+	st := m.Stat(Query{Op: "x", R: AllTime}, 0)
+	if st.N != 4 || st.Unseen != 1 || st.Total() != 5 || st.Unexplained != 2 {
+		t.Fatalf("stat = %+v", st)
 	}
 }

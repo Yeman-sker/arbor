@@ -6,8 +6,11 @@
 //
 // Every benchmark runs at least five times and is judged by its median. A
 // regression is a median more than 10% slower AND beyond the measured run-to-run
-// noise; allocation counts compare exactly. An improvement tightens the stored
-// baseline, so it can only get better.
+// noise; allocation counts compare exactly. compare -update tightens the stored
+// baseline on an improvement, so it can only get better.
+//
+// climb is how an agent works on performance, and check proves the measuring can
+// be trusted: see docs/perf-climb.md.
 package main
 
 import (
@@ -47,11 +50,19 @@ var runBenchmarks = func(root, bench, benchtime string, count int, progress io.W
 
 func main() { os.Exit(run(os.Args[1:], os.Stdin, os.Stdout, os.Stderr)) }
 
-const usage = `usage: arbor-perf <record|compare|report> [flags]
+const usage = `usage: arbor-perf <climb|check|record|compare|report> [flags]
 
+  climb     work on performance one change at a time; for agents, prints JSON:
+              climb next                     what to do now, and the evidence for it
+              climb profile -op O            where the operation's benchmarks spend CPU
+              climb try -op O -hypothesis H  judge the commit: keep, revert or inconclusive
+              climb log [-op O]              every round so far
+              climb log -op O -measurement N  note a fix of what O's numbers measure
+              climb log -op O -classified N   note why the last rounds of O failed
+  check     prove the measuring works: an unchanged build must show no change and
+            a build slowed on purpose must show one; prints JSON
   record    run the benchmarks and store the result as this machine's baseline
-  compare   run the benchmarks again, report changes, fail on a regression and
-            tighten the baseline on improvements
+  compare   run the benchmarks again, report changes and fail on a regression
   report    the ranked report of real usage: -since 7d, -input <logs or export>,
             -format md|json, -out dir (writes report.md and report.json)
 
@@ -62,13 +73,15 @@ flags of record and compare:
   -count n         runs per benchmark, at least 5 (default 5)
   -benchtime t     passed to go test -benchtime
   -input file      read go test -bench output from file ("-" for stdin) instead of running it
-  -no-update       compare only: leave the baseline untouched
+  -update          compare only: tighten the baseline on improvements
+  -format f        compare only: text (default) or json
 `
 
 type config struct {
 	root, bench, benchtime, input string
 	count                         int
-	noUpdate                      bool
+	update                        bool
+	format                        string
 }
 
 func parseFlags(name string, args []string, stderr io.Writer) (config, error) {
@@ -80,9 +93,13 @@ func parseFlags(name string, args []string, stderr io.Writer) (config, error) {
 	fs.StringVar(&c.benchtime, "benchtime", "", "")
 	fs.StringVar(&c.input, "input", "", "")
 	fs.IntVar(&c.count, "count", DefaultOptions.MinRuns, "")
-	fs.BoolVar(&c.noUpdate, "no-update", false, "")
+	fs.BoolVar(&c.update, "update", false, "")
+	fs.StringVar(&c.format, "format", "text", "")
 	if err := fs.Parse(args); err != nil {
 		return c, err
+	}
+	if c.format != "text" && c.format != "json" {
+		return c, fmt.Errorf("-format %q: use text or json", c.format)
 	}
 	if c.count < DefaultOptions.MinRuns {
 		return c, fmt.Errorf("-count %d: at least %d runs are needed to tell a change from noise", c.count, DefaultOptions.MinRuns)
@@ -105,6 +122,12 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	cmd := args[0]
 	if cmd == "report" {
 		return report(args[1:], stdout, stderr)
+	}
+	if cmd == "climb" {
+		return climb(args[1:], stdout, stderr)
+	}
+	if cmd == "check" {
+		return check(args[1:], stdout, stderr)
 	}
 	if cmd != "record" && cmd != "compare" {
 		fmt.Fprintf(stderr, "arbor-perf: unknown command %q\n\n%s", cmd, usage)
@@ -234,7 +257,14 @@ func compare(c config, stdin io.Reader, stdout, stderr io.Writer) int {
 			return 2
 		}
 	}
-	printReport(stdout, m, results)
+	if c.format == "json" {
+		if err := writeJSON(stdout, newCompareJSON(c, m, results)); err != nil {
+			fmt.Fprintf(stderr, "arbor-perf: %v\n", err)
+			return 2
+		}
+	} else {
+		printReport(stdout, m, results)
+	}
 	status := make(map[string]string, len(results))
 	for _, r := range results {
 		status[r.Name] = r.Status.String()
@@ -242,17 +272,19 @@ func compare(c config, stdin io.Reader, stdout, stderr io.Writer) int {
 	appendHistory(c, m, perfstore.BenchCompare, out.Benchmarks, status, stderr)
 
 	failed := Failed(results)
-	if !c.noUpdate && !failed {
+	if c.update && !failed {
 		if updated, changed := Tighten(base.Benchmarks, out.Benchmarks, results); changed {
 			if err := SaveBaseline(path, newBaseline(m, fixture.Version, updated, time.Now())); err != nil {
 				fmt.Fprintf(stderr, "arbor-perf: %v\n", err)
 				return 2
 			}
-			fmt.Fprintf(stdout, "baseline tightened: %s\n", path)
+			fmt.Fprintf(stderr, "baseline tightened: %s\n", path)
 		}
 	}
 	if failed {
-		fmt.Fprintln(stdout, "FAIL: the baseline was left as it was")
+		if c.format != "json" {
+			fmt.Fprintln(stdout, "FAIL: the baseline was left as it was")
+		}
 		return 1
 	}
 	return 0

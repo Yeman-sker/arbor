@@ -38,7 +38,7 @@ func model() *perfagg.Model {
 
 func TestEveryOperationHasATarget(t *testing.T) {
 	for _, op := range perf.Ops() {
-		if tg := Targets[op.String()]; tg.Code == "" || tg.Benchmark == "" {
+		if tg := Targets[op.String()]; tg.Code == "" || len(tg.Benchmarks) == 0 {
 			t.Errorf("%s has no code or benchmark mapping", op)
 		}
 	}
@@ -79,15 +79,25 @@ func TestReportIsDeterministicAndReadable(t *testing.T) {
 	}
 }
 
-func TestTrendComparesWithThePeriodBefore(t *testing.T) {
+func TestTrendComparesTheLastTwoVersions(t *testing.T) {
 	m := perfagg.NewModel(time.UTC)
-	for i := range 20 {
-		m.Add(e("search", now.Add(-time.Duration(i)*time.Hour), 10))
-		m.Add(e("search", now.AddDate(0, 0, -7).Add(-time.Duration(i)*time.Hour), 20))
+	add := func(version string, ms float64, ago time.Duration, n int) {
+		for i := range n {
+			x := e("search", now.Add(-ago+time.Duration(i)*time.Minute), ms)
+			x.Version = version
+			m.Add(x)
+		}
 	}
+	add("0.1.0", 40, 90*24*time.Hour, 20)
+	add("0.2.0", 20, 2*24*time.Hour, 20)
+	add("0.3.0", 10, 24*time.Hour, 20)
+	add("0.4.0", 99, time.Hour, 2) // too few to count
 	o := Build(m, 7, now, 0).Ops[0]
-	if o.Trend == nil || *o.Trend != -0.5 {
-		t.Fatalf("trend = %v", o.Trend)
+	if o.Trend == nil || *o.Trend != -0.5 || o.TrendFrom != "0.2.0" || o.TrendTo != "0.3.0" {
+		t.Fatalf("trend = %v %s to %s", o.Trend, o.TrendFrom, o.TrendTo)
+	}
+	if !strings.Contains(Build(m, 7, now, 0).Markdown(), "-50% (0.2.0 to 0.3.0)") {
+		t.Fatal(Build(m, 7, now, 0).Markdown())
 	}
 }
 

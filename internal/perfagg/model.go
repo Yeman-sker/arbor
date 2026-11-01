@@ -15,9 +15,12 @@ import (
 	"time"
 )
 
-// MinDaySamples is how many samples a day (or a side of a comparison) needs
-// before a number is drawn or compared: fewer is a gap, not a point.
-const MinDaySamples = 5
+// MinSamples is how many samples a version or an operation needs before its
+// numbers are evidence. Below it they are shown as thin and never compared.
+const MinSamples = 20
+
+// MinEffect is the smallest change, as a fraction, worth calling a change.
+const MinEffect = 0.05
 
 // SlowestPerDay is how many of the slowest samples a day keeps.
 const SlowestPerDay = 10
@@ -46,6 +49,8 @@ type bucket struct {
 	phases            map[string][]float32
 	slow              []perfstore.Entry // the slowest ok samples, slowest first
 	errors, cancelled int
+	unseen            int
+	unexplained       int // ok samples whose phases miss much of their duration
 }
 
 // opData holds the samples of one operation by day.
@@ -149,12 +154,28 @@ func (m *Model) Add(e perfstore.Entry) {
 				b.phases[p.Name] = append(b.phases[p.Name], float32(sum))
 			}
 		}
+		if !phasesExplain(e) {
+			b.unexplained++
+		}
 		b.keepSlow(e)
 	case perfstore.ResultError:
 		b.errors++
 	case perfstore.ResultCancelled:
 		b.cancelled++
+	case perfstore.ResultUnseen:
+		b.unseen++
 	}
+}
+
+// phasesExplain reports whether e's phases account for its duration: all but 20%
+// of it, and the 5 ms that timers and scheduling can lose on a quick operation.
+func phasesExplain(e perfstore.Entry) bool {
+	sum := 0.0
+	for _, p := range e.Phases {
+		sum += p.Ms
+	}
+	gap := e.Ms - sum
+	return gap <= 5 || gap <= 0.2*e.Ms
 }
 
 // keepSlow remembers e when it is among the slowest of the bucket.
@@ -262,11 +283,12 @@ type Query struct {
 
 // PhaseStat is the time one phase took, over the samples that had it.
 type PhaseStat struct {
-	Phase    string
-	N        int
-	P50, P95 float64
+	Phase string  `json:"phase"`
+	N     int     `json:"n"`
+	P50   float64 `json:"p50Ms"`
+	P95   float64 `json:"p95Ms"`
 	// Share is the phase's part of the sum of the phases' medians, 0 to 1.
-	Share float64
+	Share float64 `json:"share"`
 }
 
 // Stat is what a query found.
@@ -275,9 +297,14 @@ type Stat struct {
 	N         int
 	Errors    int
 	Cancelled int
-	P50, P95  float64
-	P99       float64
-	Max, Mean float64
+	// Unseen counts operations nobody waited for: see perf.ResultUnseen.
+	Unseen int
+	// Unexplained counts the ok samples whose phases miss much of the duration,
+	// which is a fault of the measurement until shown otherwise.
+	Unexplained int
+	P50, P95    float64
+	P99         float64
+	Max, Mean   float64
 	// Phases are sorted by median, longest first. Slowest are the slowest
 	// samples, slowest first, at most Limit of them.
 	Phases  []PhaseStat
@@ -285,7 +312,7 @@ type Stat struct {
 }
 
 // Total is every sample of the query, whatever its result.
-func (s Stat) Total() int { return s.N + s.Errors + s.Cancelled }
+func (s Stat) Total() int { return s.N + s.Errors + s.Cancelled + s.Unseen }
 
 func (m *Model) collect(q Query, fn func(b *bucket)) {
 	od := m.ops[q.Op]
@@ -337,6 +364,8 @@ func (m *Model) Stat(q Query, limit int) Stat {
 	m.collect(q, func(b *bucket) {
 		st.Errors += b.errors
 		st.Cancelled += b.cancelled
+		st.Unseen += b.unseen
+		st.Unexplained += b.unexplained
 		for _, v := range b.ms {
 			vs = append(vs, float64(v))
 			sum += float64(v)
@@ -414,4 +443,64 @@ func (m *Model) BySize(q Query) []Group {
 		}
 	}
 	return out
+}
+
+// MedianCI is a 95% confidence interval of the median of sorted, from its order
+// statistics, so it assumes no shape of the distribution. Fewer than 6 values
+// cannot give one. It takes the samples as independent, which samples of one
+// session are not quite, so read it as a lower bound on the uncertainty.
+func MedianCI(sorted []float64) (lo, hi float64, ok bool) {
+	n := len(sorted)
+	if n < 6 {
+		return 0, 0, false
+	}
+	// k is the largest rank with P(X < k) <= 2.5% for X ~ Binomial(n, 1/2).
+	k := 1
+	if n > 1000 {
+		k = max(1, int(float64(n)/2-0.98*math.Sqrt(float64(n))))
+	} else {
+		term := math.Pow(0.5, float64(n))
+		cum := term // P(X <= r-1) as r climbs from 1
+		for r := 1; r < n; r++ {
+			if cum*2 > 0.05 {
+				break
+			}
+			k = r
+			term *= float64(n-r+1) / float64(r)
+			cum += term
+		}
+	}
+	return sorted[k-1], sorted[n-k], true
+}
+
+// Verdicts of comparing a build with an earlier one.
+const (
+	VerdictFaster = "faster"
+	VerdictSlower = "slower"
+	VerdictFlat   = "no_clear_change"
+	VerdictThin   = "too_few_samples"
+	VerdictMixed  = "mixed_sizes"
+)
+
+// Judge compares the sorted durations of a later build with an earlier one's. A
+// change needs intervals that do not overlap and at least MinEffect, because a
+// log is not an experiment: anything less can come from what was being done.
+func Judge(earlier, later []float64) (verdict string, change float64) {
+	if len(earlier) < MinSamples || len(later) < MinSamples {
+		return VerdictThin, 0
+	}
+	aLo, aHi, _ := MedianCI(earlier)
+	bLo, bHi, _ := MedianCI(later)
+	a, b := Percentile(earlier, 50), Percentile(later, 50)
+	if a <= 0 {
+		return VerdictFlat, 0
+	}
+	change = (b - a) / a
+	switch {
+	case change <= -MinEffect && bHi < aLo:
+		return VerdictFaster, change
+	case change >= MinEffect && bLo > aHi:
+		return VerdictSlower, change
+	}
+	return VerdictFlat, change
 }

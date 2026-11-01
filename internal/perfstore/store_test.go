@@ -348,7 +348,7 @@ func TestRetentionBySizeRemovesTheOldestFirstAndKeepsToday(t *testing.T) {
 func TestStoreAppliesRetentionWhenItOpens(t *testing.T) {
 	dir := t.TempDir()
 	now := time.Date(2026, 10, 31, 15, 0, 0, 0, time.UTC)
-	writeLog(t, dir, now.AddDate(0, 0, -60), 10)
+	writeLog(t, dir, now.AddDate(0, 0, -400), 10)
 	writeLog(t, dir, now.AddDate(0, 0, -2), 10)
 	s := Open(dir, Options{Version: "1", Now: func() time.Time { return now }})
 	s.Flush()

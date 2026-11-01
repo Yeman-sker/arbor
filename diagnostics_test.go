@@ -1,12 +1,16 @@
 package main
 
 import (
+	"arbor/internal/machine"
 	"arbor/internal/perfreport"
 	"arbor/internal/perfstore"
 	"arbor/perf"
 	"bytes"
+	"fmt"
 	"os"
 	"path/filepath"
+	"runtime/debug"
+	"strings"
 	"testing"
 	"time"
 
@@ -193,15 +197,18 @@ func seedPerfLog(t *testing.T, dir string, now time.Time) {
 	day := func(i int) time.Time { return now.AddDate(0, 0, -i) }
 	for i := 29; i >= 0; i-- {
 		version := "0.1.0"
-		if i < 12 {
+		if i < 20 {
 			version = "0.2.0"
+		}
+		if i < 10 {
+			version = "0.3.0"
 		}
 		ops := []struct {
 			op   string
 			base float64
 		}{{"open_file", 160}, {"commit", 520}, {"switch_branch", 700}, {"mode_switch", 3}, {"expand_commit", 90}, {"external_change", 900}}
 		for _, o := range ops {
-			if o.op == "expand_commit" && i > 10 && i < 16 {
+			if o.op == "expand_commit" && version == "0.2.0" {
 				continue // a gap
 			}
 			for s := range 12 {
@@ -256,14 +263,20 @@ func TestPerformanceWindowCards(t *testing.T) {
 			expand = &p.cards[i]
 		}
 	}
-	gaps := 0
-	for _, pt := range expand.Points {
-		if pt.Gap {
-			gaps++
+	pts := expand.Points
+	if len(pts) != 3 || pts[0].Label != "0.1.0" || pts[0].Gap || !pts[1].Gap || pts[2].Label != "0.3.0" || pts[2].Gap {
+		t.Fatalf("points = %+v", pts)
+	}
+	if !expand.HasChange || expand.Change >= 0 || expand.Base != "0.1.0" || expand.Build != "0.3.0" {
+		t.Fatalf("change=%v %v from %s to %s", expand.HasChange, expand.Change, expand.Base, expand.Build)
+	}
+	for _, want := range []string{"0.1.0", "0.2.0", "0.3.0"} {
+		if !tt.HasText(want) {
+			t.Errorf("no %q along the axis in %v", want, tt.Texts())
 		}
 	}
-	if gaps != 5 || !expand.HasChange || expand.Change >= 0 || len(expand.Marks) != 1 || expand.Marks[0].Version != "0.2.0" {
-		t.Fatalf("gaps=%d change=%v %v marks=%v", gaps, expand.HasChange, expand.Change, expand.Marks)
+	if !hasTextContaining(tt, "since 0.1.0") {
+		t.Fatalf("the change does not say from where: %v", tt.Texts())
 	}
 	if !hasTextContaining(tt, "budget") {
 		t.Fatal("no budget standing on any card")
@@ -283,7 +296,7 @@ func TestPerformanceWindowCards(t *testing.T) {
 	// A card opens its detail: phases and slowest samples.
 	tt.ClickAt(r.X+200, r.Y+6)
 	tt.Frame()
-	if p.detail != "open_file" || !tt.HasText("Phases") || !tt.HasText("Slowest samples") || !tt.HasText("git_status") {
+	if p.detail != "open_file" || !tt.HasText("On 0.3.0") || !tt.HasText("Phases") || !tt.HasText("Slowest samples") || !tt.HasText("git_status") {
 		t.Fatalf("detail=%q %v", p.detail, tt.Texts())
 	}
 	if err := tt.Click("All operations"); err != nil {
@@ -295,12 +308,12 @@ func TestPerformanceWindowCards(t *testing.T) {
 	}
 
 	// Filters rebuild the cards.
-	if err := tt.Click("7d"); err != nil {
+	if err := tt.Click("Last 5"); err != nil {
 		t.Fatal(err)
 	}
 	tt.Frame()
-	if p.days != 7 || len(p.cards[0].Points) != 7 {
-		t.Fatalf("days=%d points=%d", p.days, len(p.cards[0].Points))
+	if p.last != 5 || len(p.cards[0].Points) != 3 {
+		t.Fatalf("last=%d points=%d", p.last, len(p.cards[0].Points))
 	}
 	if err := tt.Click("Small"); err != nil {
 		t.Fatal(err)
@@ -314,27 +327,105 @@ func TestPerformanceWindowCards(t *testing.T) {
 	}
 }
 
-func TestPerformanceWindowBenchmarks(t *testing.T) {
+func TestPerformanceWindowClimb(t *testing.T) {
 	dir := t.TempDir()
 	now := time.Date(2026, 10, 31, 12, 0, 0, 0, time.Local)
+	key := machine.Detect().Key
+	ledger := filepath.Join(perfstore.BenchDir(dir), perfstore.RoundsFile)
+	for _, r := range []perfstore.Round{
+		{T: now.AddDate(0, 0, -3), Kind: perfstore.RoundTry, Op: "open_file", Note: "read less of the tree", Commit: "bbbbbbb", Base: "aaaaaaa", Machine: key, Verdict: perfstore.VerdictKeep, Reason: "train_and_holdout_improved",
+			Target: []perfstore.RoundBench{{Name: "OpenFile/large", BaseNs: 4e7, CurNs: 3e7}, {Name: "OpenFile/small", BaseNs: 2e6, CurNs: 2e6}}},
+		{T: now.AddDate(0, 0, -2), Kind: perfstore.RoundTry, Op: "open_file", Note: "cache everything", Commit: "ccccccc", Base: "bbbbbbb", Machine: key, Verdict: perfstore.VerdictRevert, Reason: "train_improved_holdout_flat",
+			Target: []perfstore.RoundBench{{Name: "OpenFile/large", BaseNs: 3e7, CurNs: 1e7}}},
+		{T: now.AddDate(0, 0, -1), Kind: perfstore.RoundTry, Op: "open_file", Note: "skip the sort", Commit: "ddddddd", Base: "bbbbbbb", Machine: key, Verdict: perfstore.VerdictKeep, Reason: "train_and_holdout_improved",
+			Target: []perfstore.RoundBench{{Name: "OpenFile/large", BaseNs: 3e7, CurNs: 2e7}}},
+		{T: now, Kind: perfstore.RoundTry, Op: "search", Commit: "eeeeeee", Base: "ddddddd", Machine: "elsewhere", Verdict: perfstore.VerdictKeep,
+			Target: []perfstore.RoundBench{{Name: "Frame/search/large", BaseNs: 3e7, CurNs: 2e7}}},
+		{T: now, Kind: perfstore.RoundMeasurement, Op: "external_change", Note: "spans waited for a window out of sight"},
+	} {
+		if err := perfstore.AppendRound(ledger, r); err != nil {
+			t.Fatal(err)
+		}
+	}
 	p, tt := perfTester(t, dir, now)
-	if err := tt.Click("Benchmarks"); err != nil {
+	if err := tt.Click("Climb"); err != nil {
 		t.Fatal(err)
 	}
 	tt.Frame()
-	if !hasTextContaining(tt, "arbor-perf record") {
-		t.Fatalf("no hint: %v", tt.Texts())
+	var large *trendCard
+	for i := range p.cards {
+		if p.cards[i].Key == "OpenFile/large" {
+			large = &p.cards[i]
+		}
+		if p.cards[i].Key == "Frame/search/large" {
+			t.Fatal("a round of another machine class is not comparable")
+		}
 	}
-	cards, _ := benchCards([]perfstore.BenchRow{
-		{T: now.AddDate(0, 0, -3), Name: "OpenFile/large", Ns: 2e7, MinNs: 19e6, MaxNs: 21e6, Machine: "m", Version: "0.1.0"},
-		{T: now, Name: "OpenFile/large", Ns: 1e7, Machine: "m", Version: "0.2.0"},
-		{T: now, Name: "Other/small", Ns: 1e7, Machine: "elsewhere"},
-		{T: now.AddDate(0, -3, 0), Name: "Old/large", Ns: 1e7, Machine: "m"},
-	}, "m", 30, "large", now)
-	if len(cards) != 1 || cards[0].Current != 10 || cards[0].Change != -0.5 || len(cards[0].Marks) != 1 {
-		t.Fatalf("cards = %+v", cards)
+	if large == nil || len(large.Points) != 3 || large.Current != 20 || large.Base != "aaaaaaa" || large.Build != "ddddddd" || large.Change != -0.5 {
+		t.Fatalf("card = %+v", large)
 	}
-	_ = p
+	if !strings.HasPrefix(p.info, "2 kept of 4") {
+		t.Fatalf("info = %q", p.info)
+	}
+	// What was thrown away is on show too, with why.
+	for _, want := range []string{"Rounds", "cache everything", "revert · train improved holdout flat", "spans waited for a window out of sight"} {
+		if !hasTextContaining(tt, want) {
+			t.Errorf("no %q in %v", want, tt.Texts())
+		}
+	}
+	if err := tt.Click("Small"); err != nil {
+		t.Fatal(err)
+	}
+	tt.Frame()
+	if len(p.cards) != 1 || p.cards[0].Key != "OpenFile/small" {
+		t.Fatalf("small = %+v", p.cards)
+	}
+
+	empty, emptyTester := perfTester(t, t.TempDir(), now)
+	if err := emptyTester.Click("Climb"); err != nil {
+		t.Fatal(err)
+	}
+	emptyTester.Frame()
+	if len(empty.cards) != 0 || !hasTextContaining(emptyTester, "climb next") {
+		t.Fatalf("no hint: %v", emptyTester.Texts())
+	}
+}
+
+func TestBuildTicksFitAndKeepTheNewest(t *testing.T) {
+	var points []trendPoint
+	for i := range 40 {
+		points = append(points, trendPoint{Label: fmt.Sprintf("0.%d.0", i)})
+	}
+	ticks := buildTicks(points, 270)
+	if len(ticks) > 6 || len(ticks) < 3 || ticks[len(ticks)-1].Label != "0.39.0" {
+		t.Fatalf("ticks = %+v", ticks)
+	}
+	if ticks[0].At >= ticks[1].At || ticks[len(ticks)-1].At != slotX(39, 40) {
+		t.Fatalf("ticks out of order: %+v", ticks)
+	}
+	if one := buildTicks(points[:1], 270); len(one) != 1 || one[0].At != 0.5 {
+		t.Fatalf("one = %+v", one)
+	}
+	if none := buildTicks(nil, 270); len(none) != 0 {
+		t.Fatalf("none = %+v", none)
+	}
+}
+
+func TestCommitVersion(t *testing.T) {
+	const rev = "5e6b2964bf35aaaa"
+	if got := commitVersion([]debug.BuildSetting{{Key: "vcs.revision", Value: rev}, {Key: "vcs.modified", Value: "false"}}); got != "5e6b296" {
+		t.Fatal(got)
+	}
+	got := commitVersion([]debug.BuildSetting{{Key: "vcs.modified", Value: "true"}, {Key: "vcs.revision", Value: rev}})
+	if got != "5e6b296+dirty" || perfstore.SafeVersion(got) != got {
+		t.Fatalf("%q is not kept as %q", got, perfstore.SafeVersion(got))
+	}
+	if got := commitVersion(nil); got != "" {
+		t.Fatal(got)
+	}
+	if got := buildVersion("0.3.0"); got != "0.3.0" {
+		t.Fatal(got)
+	}
 }
 
 func TestExportPreviewThenSave(t *testing.T) {

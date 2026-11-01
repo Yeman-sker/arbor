@@ -1,0 +1,3 @@
+{"t":"2026-10-31T23:35:30Z","kind":"measurement","op":"external_change","note":"Spans now split out the wait for the first paint, and one held over 2 s by a hidden window ends as unseen. Older samples counted that wait as work."}
+{"t":"2026-10-31T23:35:30Z","kind":"measurement","op":"mode_switch","note":"Spans now split out the wait for the first paint, and one held over 2 s by a hidden window ends as unseen. Older samples counted that wait as work."}
+{"t":"2026-10-31T23:35:30Z","kind":"measurement","op":"expand_commit","note":"Spans now split out the wait for the first paint, and one held over 2 s by a hidden window ends as unseen. Older samples counted that wait as work."}
