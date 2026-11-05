@@ -27,7 +27,7 @@ func LoadWorktreeState(root string) (*RepoSnapshot, error) {
 	wg.Add(2)
 	go func() {
 		defer wg.Done()
-		stOut, stErr = Run(root, "status", "--porcelain=v2", "--branch", "-uall")
+		stOut, stErr = Run(root, statusArgs...)
 	}()
 	go func() {
 		defer wg.Done()
@@ -57,6 +57,7 @@ func MergeWorktreeState(prev, fresh *RepoSnapshot) *RepoSnapshot {
 	next.Staged = fresh.Staged
 	next.Unstaged = fresh.Unstaged
 	next.StatusByRel = fresh.StatusByRel
+	next.Ignored = fresh.Ignored
 	next.TreeRoots = fresh.TreeRoots
 	next.TreeDirs = fresh.TreeDirs
 	next.AllFiles = fresh.AllFiles

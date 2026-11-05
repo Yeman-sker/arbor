@@ -147,7 +147,7 @@ func BenchmarkGitStatus(b *testing.B) {
 	perSize(b, func(b *testing.B, _ fixture.Spec, dir string) {
 		for b.Loop() {
 			injectSlowdown()
-			if _, err := git.Run(dir, "status", "--porcelain=v2", "--branch", "-uall"); err != nil {
+			if _, err := git.Run(dir, "status", "--porcelain=v2", "--branch", "-uall", "--ignored=matching"); err != nil {
 				b.Fatal(err)
 			}
 		}

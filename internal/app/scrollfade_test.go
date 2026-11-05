@@ -632,6 +632,7 @@ func TestScrollFadeSwitchingFilesDoesNotRevealCodeThumb(t *testing.T) {
 	}
 	a.repo.TreeRoots = append([]string{"short.txt", "mid.txt"}, a.repo.TreeRoots...)
 	a.repo.AllFiles = a.repo.TreeRoots
+	a.tree.version++
 	for _, wrap := range []bool{false, true} {
 		a.codeSoftWrap = wrap
 		tt := ui.NewTester(a.view, 1280, 800)

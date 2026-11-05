@@ -133,6 +133,7 @@ func (h *harness) settle() {
 		h.a.live.loads.Wait()
 		n := h.fake.drain()
 		h.tt.Frame()
+		h.a.live.loads.Wait() // what the frame started, as a search does
 		if n == 0 && h.quiet() {
 			return
 		}
