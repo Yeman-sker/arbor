@@ -1,6 +1,8 @@
 package git
 
 import (
+	"bytes"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -9,6 +11,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 )
 
 // makeFifo makes a named pipe, on the systems that have them.
@@ -330,7 +333,7 @@ func TestReadFilePreview(t *testing.T) {
 	if p := ReadFilePreview(root, "logo.png"); p.Kind != PreviewBinary || p.Size != 10 || p.Text != "" {
 		t.Errorf("binary: %+v", p)
 	}
-	if p := ReadFilePreview(root, "big.txt"); p.Kind != PreviewText || !strings.Contains(p.Text, "truncated") || p.Size != maxPreviewBytes+10 {
+	if p := ReadFilePreview(root, "big.txt"); p.Kind != PreviewText || p.Partial() || strings.Contains(p.Text, "truncated") || p.Size != maxPreviewBytes+10 {
 		t.Errorf("big: kind %v size %d", p.Kind, p.Size)
 	}
 	if p := ReadFilePreview(root, "nope.txt"); p.Kind != PreviewMissing {
@@ -380,6 +383,248 @@ func TestCompareNatural(t *testing.T) {
 	for _, s := range sorted {
 		if compareNatural(s, s) != 0 {
 			t.Errorf("%s differs from itself", s)
+		}
+	}
+}
+
+// numberedLines returns lines that are all different, at least size bytes of them.
+func numberedLines(size int) []byte {
+	var b bytes.Buffer
+	b.Grow(size + 32)
+	for i := 0; b.Len() < size; i++ {
+		fmt.Fprintf(&b, "line %d of a long log\n", i)
+	}
+	return b.Bytes()
+}
+
+func writeBigFile(t *testing.T, root, rel string, data []byte) {
+	t.Helper()
+	if err := os.WriteFile(filepath.Join(root, rel), data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// wantPart checks that p holds the bytes of data it says it does, as whole lines.
+func wantPart(t *testing.T, name string, p FilePreview, data []byte) {
+	t.Helper()
+	if p.Kind != PreviewText || p.Size != int64(len(data)) {
+		t.Fatalf("%s: kind %v, size %d of %d", name, p.Kind, p.Size, len(data))
+	}
+	if p.Text != string(data[p.Start:p.End]) {
+		t.Fatalf("%s: text is not the bytes from %d to %d", name, p.Start, p.End)
+	}
+	if p.End-p.Start > previewPartBytes {
+		t.Errorf("%s: %d bytes, more than a part", name, p.End-p.Start)
+	}
+	if p.Start > 0 && data[p.Start-1] != '\n' {
+		t.Errorf("%s: starts inside a line, at %d", name, p.Start)
+	}
+	if !strings.HasSuffix(p.Text, "\n") {
+		t.Errorf("%s: ends inside a line, at %d", name, p.End)
+	}
+}
+
+func TestALargeFileIsReadAPartAtATime(t *testing.T) {
+	root := t.TempDir()
+	data := numberedLines(previewPartBytes*2 + previewPartBytes/2)
+	writeBigFile(t, root, "big.log", data)
+	size := int64(len(data))
+
+	first := ReadFilePreview(root, "big.log")
+	wantPart(t, "first", first, data)
+	if first.Start != 0 || first.End >= size || !first.Partial() {
+		t.Errorf("first: %d to %d of %d, partial %v", first.Start, first.End, size, first.Partial())
+	}
+
+	next := ReadFilePreviewAt(root, "big.log", PreviewPlace{Offset: first.End})
+	wantPart(t, "next", next, data)
+	if next.Start != first.End || next.End >= size {
+		t.Errorf("next: %d to %d, after %d", next.Start, next.End, first.End)
+	}
+
+	back := ReadFilePreviewAt(root, "big.log", PreviewPlace{Kind: PlaceUpTo, Offset: next.End})
+	wantPart(t, "back", back, data)
+	if back.End != next.End || back.Start <= 0 {
+		t.Errorf("back: %d to %d, up to %d", back.Start, back.End, next.End)
+	}
+
+	end := ReadFilePreviewAt(root, "big.log", PreviewPlace{Kind: PlaceEnd})
+	wantPart(t, "end", end, data)
+	if end.End != size || end.Start <= 0 || !end.Partial() {
+		t.Errorf("end: %d to %d of %d", end.Start, end.End, size)
+	}
+
+	// A file can have become shorter since the part was asked for, as a rotated log.
+	for name, place := range map[string]PreviewPlace{
+		"from past the end":  {Offset: size + 100},
+		"up to past the end": {Kind: PlaceUpTo, Offset: size + 100},
+	} {
+		if got := ReadFilePreviewAt(root, "big.log", place); got != end {
+			t.Errorf("%s: %d to %d, want the end of the file", name, got.Start, got.End)
+		}
+	}
+}
+
+// Going on from where a part ends, or back from where one starts, misses nothing.
+func TestThePartsOfAFileAddUpToIt(t *testing.T) {
+	root := t.TempDir()
+	data := numberedLines(previewPartBytes*2 + previewPartBytes/2)
+	writeBigFile(t, root, "big.log", data)
+
+	var forward strings.Builder
+	for place := (PreviewPlace{}); ; {
+		p := ReadFilePreviewAt(root, "big.log", place)
+		forward.WriteString(p.Text)
+		if p.End >= p.Size {
+			break
+		}
+		place = PreviewPlace{Offset: p.End}
+	}
+	if forward.String() != string(data) {
+		t.Errorf("forward: %d bytes of %d", forward.Len(), len(data))
+	}
+
+	var backward []string
+	for place := (PreviewPlace{Kind: PlaceEnd}); ; {
+		p := ReadFilePreviewAt(root, "big.log", place)
+		backward = append(backward, p.Text)
+		if p.Start == 0 {
+			break
+		}
+		place = PreviewPlace{Kind: PlaceUpTo, Offset: p.Start}
+	}
+	slices.Reverse(backward)
+	if got := strings.Join(backward, ""); got != string(data) {
+		t.Errorf("backward: %d bytes of %d", len(got), len(data))
+	}
+}
+
+// Minified code can be one line longer than a part: it cuts between characters.
+func TestAPartWithoutLineBreaksEndsBetweenCharacters(t *testing.T) {
+	root := t.TempDir()
+	data := []byte(strings.Repeat("界", (previewPartBytes+previewPartBytes/2)/3))
+	writeBigFile(t, root, "one-line.min.js", data)
+
+	first := ReadFilePreview(root, "one-line.min.js")
+	end := ReadFilePreviewAt(root, "one-line.min.js", PreviewPlace{Kind: PlaceEnd})
+	next := ReadFilePreviewAt(root, "one-line.min.js", PreviewPlace{Offset: first.End})
+	back := ReadFilePreviewAt(root, "one-line.min.js", PreviewPlace{Kind: PlaceUpTo, Offset: end.Start})
+	for name, p := range map[string]FilePreview{"first": first, "end": end, "next": next, "back": back} {
+		if !utf8.ValidString(p.Text) || p.Text == "" {
+			t.Errorf("%s: %d to %d cuts a character", name, p.Start, p.End)
+		}
+		if p.Text != string(data[p.Start:p.End]) {
+			t.Errorf("%s: text is not the bytes from %d to %d", name, p.Start, p.End)
+		}
+	}
+}
+
+func TestAPartReadsWhatTheFileHasGrownTo(t *testing.T) {
+	root := t.TempDir()
+	data := numberedLines(previewPartBytes + 1024)
+	writeBigFile(t, root, "big.log", data)
+	first := ReadFilePreview(root, "big.log")
+	last := ReadFilePreviewAt(root, "big.log", PreviewPlace{Offset: first.End})
+
+	const more = "one more line\n"
+	data = append(data, more...)
+	writeBigFile(t, root, "big.log", data)
+
+	// A part with room for it takes it in.
+	again := ReadFilePreviewAt(root, "big.log", PreviewPlace{Offset: last.Start})
+	wantPart(t, "last", again, data)
+	if again.Start != last.Start || again.End != int64(len(data)) || !strings.HasSuffix(again.Text, more) {
+		t.Errorf("last: %d to %d of %d", again.Start, again.End, len(data))
+	}
+
+	// A full one stays as it was, and what follows is a part further on.
+	again = ReadFilePreviewAt(root, "big.log", PreviewPlace{Offset: first.Start})
+	wantPart(t, "first", again, data)
+	if again.Start != first.Start || again.End != first.End || again.Size != int64(len(data)) {
+		t.Errorf("first: %d to %d of %d", again.Start, again.End, again.Size)
+	}
+}
+
+func TestAFileAsLargeAsAPartShowsWhole(t *testing.T) {
+	root := t.TempDir()
+	data := bytes.Repeat([]byte("x"), previewPartBytes)
+	writeBigFile(t, root, "exact.txt", data)
+	p := ReadFilePreview(root, "exact.txt")
+	if p.Partial() || p.Start != 0 || p.End != int64(len(data)) || len(p.Text) != len(data) {
+		t.Errorf("%d to %d of %d, partial %v", p.Start, p.End, p.Size, p.Partial())
+	}
+}
+
+// Whether a file is text goes by how it starts, so that no part of it says otherwise.
+func TestAPartIsBinaryIfTheFileStartsThatWay(t *testing.T) {
+	root := t.TempDir()
+	binary := append([]byte("\x00\x01"), numberedLines(previewPartBytes+1024)...)
+	writeBigFile(t, root, "data.bin", binary)
+	text := append(numberedLines(binarySniffBytes+16), 0, 1, 2)
+	text = append(text, numberedLines(previewPartBytes+1024)...)
+	writeBigFile(t, root, "install.sh", text)
+	for _, place := range []PreviewPlace{{}, {Offset: previewPartBytes}, {Kind: PlaceEnd}, {Kind: PlaceUpTo, Offset: previewPartBytes}} {
+		if p := ReadFilePreviewAt(root, "data.bin", place); p.Kind != PreviewBinary {
+			t.Errorf("data.bin at %+v: kind %v", place, p.Kind)
+		}
+		if p := ReadFilePreviewAt(root, "install.sh", place); p.Kind != PreviewText {
+			t.Errorf("install.sh at %+v: kind %v", place, p.Kind)
+		}
+	}
+}
+
+func TestChangedLines(t *testing.T) {
+	dir, _ := makeRepo(t, []commitSpec{{file: "first.txt", msg: "first", date: "2024-01-02T03:04:05Z"}})
+	write := func(rel, content string) {
+		t.Helper()
+		writeBigFile(t, dir, rel, []byte(content))
+	}
+	write("a.txt", "1\n2\n3\n4\n")
+	write("[a].txt", "1\n")
+	write("logo.bin", "\x00\x01\x02")
+	testGit(t, dir, "add", ".")
+	testGit(t, dir, "commit", "-m", "files")
+
+	for _, tc := range []struct {
+		rel     string
+		content string
+		want    int
+		ok      bool
+	}{
+		{"a.txt", "1\n2\n3\n4\n", 0, true},
+		{"a.txt", "1\nchanged\n3\n4\nadded\n", 3, true},
+		{"[a].txt", "1\n", 0, true}, // the name is not a pattern, which would match a.txt
+		{"logo.bin", "\x00\x01\x03", 0, false},
+		{"not-listed.txt", "new\n", 0, true},
+	} {
+		write(tc.rel, tc.content)
+		if got, ok := ChangedLines(dir, tc.rel); got != tc.want || ok != tc.ok {
+			t.Errorf("%s: %d, %v; want %d, %v", tc.rel, got, ok, tc.want, tc.ok)
+		}
+	}
+
+	noHead := t.TempDir()
+	testGit(t, noHead, "init", "-b", "main")
+	writeBigFile(t, noHead, "a.txt", []byte("1\n"))
+	if _, ok := ChangedLines(noHead, "a.txt"); ok {
+		t.Error("a repository with no commit has nothing to compare with")
+	}
+}
+
+func TestReadTextAtRefReadsAllOfAFile(t *testing.T) {
+	dir, _ := makeRepo(t, []commitSpec{{file: "first.txt", msg: "first", date: "2024-01-02T03:04:05Z"}})
+	long := numberedLines(maxPreviewBytes * 2)
+	writeBigFile(t, dir, "long.txt", long)
+	writeBigFile(t, dir, "logo.bin", []byte("\x00\x01\x02"))
+	testGit(t, dir, "add", ".")
+	testGit(t, dir, "commit", "-m", "files")
+
+	if got := ReadTextAtRef(dir, "HEAD", "long.txt"); got != string(long) {
+		t.Errorf("long.txt: %d bytes of %d", len(got), len(long))
+	}
+	for _, rel := range []string{"logo.bin", "not-there.txt"} {
+		if got := ReadTextAtRef(dir, "HEAD", rel); got != "" {
+			t.Errorf("%s: %d bytes, want no text", rel, len(got))
 		}
 	}
 }

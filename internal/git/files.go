@@ -186,20 +186,57 @@ const (
 	PreviewUnreadable
 )
 
+// previewPartBytes is how much of a file the Files view holds at a time. A file
+// that fits shows whole. A larger one, as a log can be of any size, shows a part
+// at a time, which it moves through.
+const previewPartBytes = 16 << 20
+
+// PlaceKind says how a PreviewPlace finds the part of a file to read.
+type PlaceKind uint8
+
+const (
+	// PlaceFrom is the part that starts at Offset.
+	PlaceFrom PlaceKind = iota
+	// PlaceUpTo is the part that ends at Offset.
+	PlaceUpTo
+	// PlaceEnd is the part that ends with the file.
+	PlaceEnd
+)
+
+// PreviewPlace says which part of a file to read. Its zero value is the start.
+type PreviewPlace struct {
+	Kind   PlaceKind
+	Offset int64
+}
+
 // FilePreview is what the Files view shows for a file.
 type FilePreview struct {
 	Kind PreviewKind
-	// Text is the text of a PreviewText file, cut at maxPreviewBytes.
+	// Text is the text of a PreviewText file, or of the part of it that was read.
 	Text string
 	// Size is the size of the file, in bytes.
 	Size int64
+	// Start and End are the bytes of the file that Text holds.
+	Start, End int64
 	// Reason says why a PreviewUnreadable file could not be read.
 	Reason string
+}
+
+// Partial reports whether Text holds less than the whole file.
+func (p FilePreview) Partial() bool {
+	return p.Start > 0 || p.End < p.Size
 }
 
 // ReadFilePreview reads the file rel of the working tree. It never blocks on
 // something that is not a file, as opening a pipe would.
 func ReadFilePreview(root, rel string) FilePreview {
+	return ReadFilePreviewAt(root, rel, PreviewPlace{})
+}
+
+// ReadFilePreviewAt is ReadFilePreview for a part of the file. A part ends and
+// starts with whole lines, so that no line shows cut in two, unless it has no line
+// break to go by.
+func ReadFilePreviewAt(root, rel string, place PreviewPlace) FilePreview {
 	abs := filepath.Join(root, filepath.FromSlash(rel))
 	fi, err := os.Stat(abs)
 	if err != nil {
@@ -222,23 +259,102 @@ func ReadFilePreview(root, rel string) FilePreview {
 		return FilePreview{Kind: PreviewUnreadable, Size: fi.Size(), Reason: readFailure(err)}
 	}
 	defer f.Close()
-	data, err := io.ReadAll(io.LimitReader(f, maxPreviewBytes+1))
-	if err != nil {
+	// Whether it is text goes by how the file starts, whichever part is asked for.
+	head := make([]byte, binarySniffBytes)
+	n, err := f.ReadAt(head, 0)
+	if err != nil && !errors.Is(err, io.EOF) {
 		return FilePreview{Kind: PreviewUnreadable, Size: fi.Size(), Reason: readFailure(err)}
 	}
 	switch {
-	case len(data) == 0:
+	case n == 0:
 		return FilePreview{Kind: PreviewEmpty}
-	case looksBinary(data):
+	case looksBinary(head[:n]):
 		return FilePreview{Kind: PreviewBinary, Size: fi.Size()}
 	}
-	return FilePreview{Kind: PreviewText, Text: sanitizePreviewText(data), Size: fi.Size()}
+
+	place = place.within(fi.Size())
+	start, want := previewRange(place, fi.Size())
+	data, err := io.ReadAll(io.NewSectionReader(f, start, want))
+	if err != nil {
+		return FilePreview{Kind: PreviewUnreadable, Size: fi.Size(), Reason: readFailure(err)}
+	}
+	// It may have grown since it was looked at, as a log does.
+	size := max(fi.Size(), start+int64(len(data)))
+	end := start + int64(len(data))
+	if end < size && place.Kind != PlaceUpTo {
+		cut := alignPartEnd(data)
+		data = data[:cut]
+		end = start + int64(cut)
+	}
+	if start > 0 && place.Kind != PlaceFrom {
+		cut := alignPartStart(data)
+		data = data[cut:]
+		start += int64(cut)
+	}
+	return FilePreview{Kind: PreviewText, Text: string(data), Size: size, Start: start, End: end}
 }
+
+// within returns the place in a file of the size: past its end, as in a log rotated
+// since it was asked for, it is the end.
+func (p PreviewPlace) within(size int64) PreviewPlace {
+	switch {
+	case p.Kind == PlaceFrom && p.Offset >= size && size > 0, p.Kind == PlaceUpTo && p.Offset > size:
+		return PreviewPlace{Kind: PlaceEnd}
+	}
+	return p
+}
+
+// previewRange returns where the part of a file of the size starts, and how much
+// of it to read.
+func previewRange(place PreviewPlace, size int64) (start, want int64) {
+	switch place.Kind {
+	case PlaceFrom:
+		return place.Offset, previewPartBytes
+	case PlaceUpTo:
+		start = max(0, place.Offset-previewPartBytes)
+		return start, place.Offset - start
+	}
+	return max(0, size-previewPartBytes), previewPartBytes
+}
+
+// alignPartStart returns where the first whole line of a part starts. With no line
+// break in it, it is where the first whole character does.
+func alignPartStart(data []byte) int {
+	if i := bytes.IndexByte(data, '\n'); i >= 0 && i+1 < len(data) {
+		return i + 1
+	}
+	for i := 0; i < len(data) && i < utf8.UTFMax; i++ {
+		if utf8.RuneStart(data[i]) {
+			return i
+		}
+	}
+	return 0
+}
+
+// alignPartEnd returns where the last whole line of a part ends. With no line break
+// in it, it is where the last whole character does.
+func alignPartEnd(data []byte) int {
+	if i := bytes.LastIndexByte(data, '\n'); i >= 0 {
+		return i + 1
+	}
+	for i := len(data) - 1; i >= 0 && i >= len(data)-utf8.UTFMax; i-- {
+		if utf8.RuneStart(data[i]) {
+			if !utf8.FullRune(data[i:]) {
+				return i
+			}
+			break
+		}
+	}
+	return len(data)
+}
+
+// binarySniffBytes is how much of the start of a file tells whether it is text.
+const binarySniffBytes = 8192
 
 // looksBinary reports whether data, the start of a file, is not text.
 func looksBinary(data []byte) bool {
-	if len(data) > 8192 {
-		data = data[:8192]
+	if len(data) > binarySniffBytes {
+		data = data[:binarySniffBytes]
 	}
 	return bytes.IndexByte(data, 0) != -1
 }

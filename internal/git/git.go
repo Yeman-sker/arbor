@@ -569,6 +569,50 @@ func ReadFileAtRef(root, ref, relPath string) string {
 	return sanitizePreviewText([]byte(out))
 }
 
+// ReadTextAtRef returns all of a text file at a ref, to compare with a file shown
+// whole, or "" when it has none: cut short, every line after the cut would count as
+// a change. Past the size of what the Files view holds whole, or if it is not text,
+// there is nothing to compare it with.
+func ReadTextAtRef(root, ref, relPath string) string {
+	out, err := Run(root, "show", ref+":"+relPath)
+	if err != nil || len(out) > previewPartBytes || looksBinary([]byte(out[:min(len(out), binarySniffBytes)])) {
+		return ""
+	}
+	return out
+}
+
+// ChangedLines returns how many lines of a file were added and removed since HEAD,
+// and whether Git could say. Git counts them without loading both versions into
+// the app, which makes this the cheap way to learn how much a comparison would take.
+func ChangedLines(root, relPath string) (int, bool) {
+	out, err := Run(root, "--literal-pathspecs", "diff", "--numstat", "HEAD", "--", relPath)
+	if err != nil {
+		return 0, false
+	}
+	if out == "" {
+		return 0, true
+	}
+	return parseNumstat(out)
+}
+
+// parseNumstat reads the first line of git diff --numstat, which counts its added
+// and removed lines, or has a dash for each in a file Git takes as binary.
+func parseNumstat(out string) (int, bool) {
+	fields := strings.SplitN(out, "\t", 3)
+	if len(fields) < 3 {
+		return 0, false
+	}
+	added, err := strconv.Atoi(fields[0])
+	if err != nil {
+		return 0, false
+	}
+	removed, err := strconv.Atoi(fields[1])
+	if err != nil {
+		return 0, false
+	}
+	return added + removed, true
+}
+
 func ReadWorktreeFile(root, relPath string) string {
 	f, err := os.Open(filepath.Join(root, filepath.FromSlash(relPath)))
 	if err != nil {

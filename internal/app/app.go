@@ -313,6 +313,8 @@ func (a *app) selectExplorerFile(relPath string) {
 	if relPath != a.selectedFile {
 		a.fileOffGit = !inTree(a.repo, relPath)
 		a.tree.cursor = relPath
+		a.live.content.place = git.PreviewPlace{}
+		a.live.content.partMove = partStay
 	}
 	a.selectedFile = relPath
 	a.openExplorerFile(relPath) // content.go: reads the file in the background
@@ -1299,6 +1301,10 @@ func (a *app) filesMainPane(c *ui.Context, t *ui.Theme) {
 
 	a.codeState.ReadOnly = true
 	a.codeState.SoftWrap = a.codeSoftWrap
+	a.codeState.LineNumbers = a.fileLineNumbers()
+	if a.openFileShowsText() {
+		a.renderFilePartBar(c, t)
+	}
 	edWrap := ui.Column(c.Key("code-viewport")).Grow(1).FillWidth()
 	k := edWrap.Keyframes("enter", []ui.Keyframe{
 		{At: 0, Value: 0},
