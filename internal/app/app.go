@@ -66,11 +66,13 @@ type app struct {
 	fades         scrollFades
 
 	// Mode 0: Files (Explorer) state
-	openDirs      map[string]bool
-	explorerList  ui.ListState
-	explorerQuery string
-	onlyChanged   bool
-	selectedFile  string
+	openDirs     map[string]bool
+	explorerList ui.ListState
+	// explorerSearch is the search field above it.
+	explorerSearch ui.Handle
+	explorerQuery  string
+	onlyChanged    bool
+	selectedFile   string
 	// fileOffGit says Git does not list the file open: it is ignored, or in a
 	// submodule or a link to a directory. Git cannot say that such a file went
 	// away, and one that a build generates may well come back.
@@ -308,6 +310,7 @@ func (a *app) selectExplorerFile(relPath string) {
 	}
 	if relPath != a.selectedFile {
 		a.fileOffGit = !inTree(a.repo, relPath)
+		a.tree.cursor = relPath
 	}
 	a.selectedFile = relPath
 	a.openExplorerFile(relPath) // content.go: reads the file in the background
@@ -563,10 +566,17 @@ func treeLabelColor(t *ui.Theme, selected, hovered bool) ui.Color {
 }
 
 func (a *app) filesSidebarBody(c *ui.Context, t *ui.Theme) {
+	if !a.tree.focusAsked {
+		a.tree.focusAsked = true
+		a.explorerList.Handle.Focus(c)
+	}
+
 	// Search & Filter bar
 	ui.Row(c).Padding(6, 8).Gap(4).AlignItems(ui.Center).
 		BorderWidth(0, 0, 1, 0).BorderColor(t.Border).Children(func() {
-		compactInput(c, "search-files", IconSearch, &a.explorerQuery, "Search files…")
+		compactInputWith(c, "search-files", IconSearch, &a.explorerQuery, "Search files…", func(in ui.Element) {
+			in.Bind(&a.explorerSearch).OnTextKey(a.onSearchKey)
+		})
 		if iconBtn(c, "btn-filter-mod", IconFilter, "Show modified files only", a.onlyChanged) {
 			a.onlyChanged = !a.onlyChanged
 		}
@@ -575,9 +585,15 @@ func (a *app) filesSidebarBody(c *ui.Context, t *ui.Theme) {
 	a.trackSearch()
 	q := strings.ToLower(strings.TrimSpace(a.explorerQuery))
 	a.syncIgnoredSearch(q)
+	a.applySearchKeys(q)
 	nodes := a.treeNodes(q)
-	filtered := q != "" || a.onlyChanged
+	// Where the keys are only shows while they would act there.
+	cursor := ""
+	if a.explorerList.Handle.FocusWithin(c) || a.explorerSearch.Focused(c) {
+		cursor = a.tree.shownCursor()
+	}
 
+	a.declareTreeKeys(c)
 	a.explorerList.Key = func(i int) any { return nodes[i].path }
 	a.fades.tree.List(c, t, a.contentSeq, &a.explorerList, len(nodes), func(i int) {
 		n := nodes[i]
@@ -590,7 +606,10 @@ func (a *app) filesSidebarBody(c *ui.Context, t *ui.Theme) {
 			Padding(0, 8, 0, float32(6+n.depth*14)).Gap(6).Radius(5).
 			AlignItems(ui.Center).Cursor(ui.CursorPointer)
 
-		hovered := row.Hovered()
+		// The row the keys are on looks like the one the pointer is on, with an
+		// edge that sets it apart from the file that is open, which can be another.
+		onCursor := cursor != "" && n.path == cursor
+		hovered := row.Hovered() || onCursor
 		pressed := row.Pressed()
 
 		targetBg := t.Surface.Alpha(0)
@@ -607,6 +626,9 @@ func (a *app) filesSidebarBody(c *ui.Context, t *ui.Theme) {
 			targetBg = t.SurfacePressed
 		} else if hovered {
 			targetBg = t.SurfaceHover
+		}
+		if onCursor {
+			targetBd = t.Accent.Alpha(treeCursorEdgeAlpha)
 		}
 		rowScale := float32(1.0)
 		if pressed {
@@ -628,13 +650,11 @@ func (a *app) filesSidebarBody(c *ui.Context, t *ui.Theme) {
 		}
 
 		if row.Clicked() {
+			a.tree.cursor = n.path
 			if n.isDir {
 				a.toggleDir(n.path)
 			} else {
-				if filtered {
-					a.revealInTree(n.path)
-				}
-				a.openFile(n.path)
+				a.openTreeFile(n.path)
 			}
 		}
 
@@ -717,7 +737,7 @@ func (a *app) filesSidebarBody(c *ui.Context, t *ui.Theme) {
 				renderStatusBadge(c, n.badge, selected || hovered)
 			}
 		})
-	}).Grow(1).MinHeight(0).Gap(3).Padding(6, 8)
+	}).Grow(1).MinHeight(0).Gap(3).Padding(6, 8).Focusable().FocusRing(false)
 }
 
 type gitRowKind int

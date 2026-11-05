@@ -87,6 +87,7 @@ func (a *app) switchMode(mode int) {
 	sp := a.beginOp(perf.OpModeSwitch)
 	a.activeMode = mode
 	a.contentSeq++
+	a.tree.focusAsked = false
 	a.paints.Arm(sp, perf.ResultOK)
 }
 

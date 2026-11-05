@@ -96,6 +96,17 @@ type fileTree struct {
 	// reveal is the file to scroll to once the tree shows it.
 	reveal string
 	search ignoredSearch
+
+	// cursor is the path of the row the keys act on, which stays on its file or
+	// directory as rows come and go. In a flat list, "" is the first row: firstEntry.
+	cursor     string
+	firstEntry string
+	// searchMoves and searchEnter are keys of the search field not yet applied.
+	searchMoves int
+	searchEnter bool
+	// focusAsked says the keyboard was given to the tree since it last should be:
+	// it gets it when it shows, so that the keys work without a click first.
+	focusAsked bool
 }
 
 // ignoredSearch finds ignored files for the search box. Listing them takes one
@@ -129,8 +140,10 @@ func (a *app) treeNodes(query string) []flatTreeNode {
 	t := &a.tree
 	key := treeKey{a.repo, t.version, query, a.onlyChanged}
 	if !t.built || t.key != key {
+		lastQuery := t.key.query
 		t.nodes = a.buildFlatTree(query)
 		t.key, t.built = key, true
+		a.settleCursor(query, lastQuery)
 		a.scrollToReveal(query)
 	}
 	return t.nodes
