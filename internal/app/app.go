@@ -70,9 +70,11 @@ type app struct {
 	explorerList ui.ListState
 	// explorerSearch is the search field above it.
 	explorerSearch ui.Handle
-	explorerQuery  string
-	onlyChanged    bool
-	selectedFile   string
+	// svgSource shows the text of SVG files rather than their pictures.
+	svgSource     bool
+	explorerQuery string
+	onlyChanged   bool
+	selectedFile  string
 	// fileOffGit says Git does not list the file open: it is ignored, or in a
 	// submodule or a link to a directory. Git cannot say that such a file went
 	// away, and one that a build generates may well come back.
@@ -441,7 +443,7 @@ func (a *app) view(c *ui.Context) {
 	}
 	if c.Shortcut(ui.Cmd, ui.KeyF) {
 		if a.activeMode == modeFiles {
-			if _, notice := a.openFileNotice(); !notice {
+			if a.openFileShowsText() {
 				a.codeState.Run(editor.Find)
 			}
 		} else {
@@ -1264,7 +1266,20 @@ func (a *app) filesMainPane(c *ui.Context, t *ui.Theme) {
 			}
 		}
 
-		if _, notice := a.openFileNotice(); notice {
+		if a.fileLoading() {
+			renderFileLoading(c, t)
+		}
+		if im := a.shownImage(); im != nil {
+			ui.Text(c, im.summary()).FontSize(12).TextColor(t.TextMuted).SingleLine().Shrink(0)
+		}
+		// An SVG is also what it says in text, which is where to look when it shows
+		// differently from what it says: not everything in one can be drawn here.
+		if im := a.openFileImage(); im != nil && im.svg {
+			if iconBtn(c, "svg-source", IconCode, "Show SVG Source", a.svgSource) {
+				a.svgSource = !a.svgSource
+			}
+		}
+		if !a.openFileShowsText() {
 			return // no text to wrap or to look through
 		}
 		if iconBtn(c, "code-wrap", IconWrapText, "Toggle Soft Wrap", a.codeSoftWrap) {
@@ -1291,6 +1306,10 @@ func (a *app) filesMainPane(c *ui.Context, t *ui.Theme) {
 	}, ui.KeyframeOptions{Run: a.contentSeq})
 	edWrap.Opacity(0.75+0.25*k).Translate(0, (1-k)*3)
 	edWrap.Children(func() {
+		if im := a.shownImage(); im != nil {
+			renderFileImage(c, im, a.live.content.file.path)
+			return
+		}
 		if p, notice := a.openFileNotice(); notice {
 			renderPreviewNotice(c, t, p)
 			return
@@ -1303,10 +1322,34 @@ func (a *app) filesMainPane(c *ui.Context, t *ui.Theme) {
 // is something to say rather than text to show.
 func (a *app) openFileNotice() (git.FilePreview, bool) {
 	f := &a.live.content.file
-	if !f.ok || f.path != a.selectedFile || f.preview.Kind == git.PreviewText {
+	if !f.ok || f.preview.Kind == git.PreviewText {
 		return git.FilePreview{}, false
 	}
 	return f.preview, true
+}
+
+// openFileShowsText reports whether the editor is what shows the file on screen.
+func (a *app) openFileShowsText() bool {
+	_, notice := a.openFileNotice()
+	return a.shownImage() == nil && !notice
+}
+
+// fileLoading reports whether the file on screen is not the one chosen, as it is
+// on its way.
+func (a *app) fileLoading() bool {
+	f := &a.live.content.file
+	return a.selectedFile != "" && f.path != a.selectedFile
+}
+
+// renderFileLoading says a file is on its way, after a moment: most files are
+// there before anyone could read it, but a big photo takes a second or two.
+func renderFileLoading(c *ui.Context, t *ui.Theme) {
+	label := ui.Text(c.Key("file-loading"), "Loading…").FontSize(12).TextColor(t.TextMuted).SingleLine().Shrink(0)
+	label.Opacity(label.Keyframes("appear", []ui.Keyframe{
+		{At: 0, Value: 0},
+		{At: 300 * time.Millisecond, Value: 0},
+		{At: 420 * time.Millisecond, Value: 1, Ease: ui.EaseOut},
+	}, ui.KeyframeOptions{}))
 }
 
 func (a *app) gitMainPane(c *ui.Context, t *ui.Theme) {

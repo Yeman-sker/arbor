@@ -7,6 +7,7 @@ import (
 	"path"
 	"sort"
 	"strings"
+	"sync/atomic"
 
 	"github.com/egoist/mygo/ui/editor"
 )
@@ -17,6 +18,8 @@ type loadedFile struct {
 	path    string
 	preview git.FilePreview
 	head    string
+	// image is the picture of an image file, nil for any other file.
+	image *fileImage
 }
 
 // loadedDiff is what the diff view shows; key says which diff it is.
@@ -33,6 +36,9 @@ type loadedDiff struct {
 type contentState struct {
 	// Each kind of load has a sequence number; only the newest is applied.
 	fileSeq, diffSeq, detailSeq uint64
+	// newestFile is fileSeq for the loads to read in the background, as one that
+	// waits for its turn to decode an image can see that it is no longer wanted.
+	newestFile atomic.Uint64
 
 	file loadedFile
 	diff loadedDiff
@@ -45,10 +51,20 @@ func (a *app) openExplorerFile(relPath string) {
 	root := a.repo.Root
 	listed := inTree(a.repo, relPath)
 	c := &a.live.content
-	c.fileSeq++
-	seq := c.fileSeq
+	seq := c.nextFile()
+	var known *fileImage
+	if c.file.ok && c.file.path == relPath {
+		known = c.file.image
+	}
 	a.goLoad(func() func() {
 		preview := git.ReadFilePreview(root, relPath)
+		var image *fileImage
+		if isImagePath(relPath) && (preview.Kind == git.PreviewText || preview.Kind == git.PreviewBinary) {
+			var current bool
+			if image, current = c.loadFileImage(root, relPath, seq, preview.Kind, known); !current {
+				return nil
+			}
+		}
 		// Only text has lines to mark, and Git has no other version of a file
 		// it doesn't list.
 		head := ""
@@ -59,19 +75,26 @@ func (a *app) openExplorerFile(relPath string) {
 			if c.fileSeq != seq || a.selectedFile != relPath {
 				return
 			}
-			a.showFile(relPath, preview, head)
+			a.showFile(relPath, preview, head, image)
 			a.pending.file.publish(a, seq, perf.PhaseLoadFile, perf.ResultOK)
 		}
 	})
 }
 
+// nextFile begins the next load of a file, which replaces any before it.
+func (c *contentState) nextFile() uint64 {
+	c.fileSeq++
+	c.newestFile.Store(c.fileSeq)
+	return c.fileSeq
+}
+
 // showFile puts the text of a file in the Files view. When it is the file
 // already shown and nothing in it changed, the editor is not touched; when
 // its text changed, the scroll position is kept.
-func (a *app) showFile(rel string, preview git.FilePreview, head string) {
+func (a *app) showFile(rel string, preview git.FilePreview, head string, image *fileImage) {
 	f := &a.live.content.file
 	same := f.ok && f.path == rel
-	if same && f.preview == preview && f.head == head {
+	if same && f.preview == preview && f.head == head && f.image == image {
 		return
 	}
 	st := a.codeState
@@ -93,14 +116,14 @@ func (a *app) showFile(rel string, preview git.FilePreview, head string) {
 	if same {
 		st.SetScrollY(scrollY)
 	}
-	*f = loadedFile{ok: true, path: rel, preview: preview, head: head}
+	*f = loadedFile{ok: true, path: rel, preview: preview, head: head, image: image}
 }
 
 // clearExplorerFile closes the file of the Files view.
 func (a *app) clearExplorerFile() {
 	a.selectedFile = ""
 	a.fileOffGit = false
-	a.live.content.fileSeq++
+	a.live.content.nextFile()
 	if a.live.content.file.ok {
 		a.codeState.Buffer.Reset("")
 		a.codeState.DiffBase = nil

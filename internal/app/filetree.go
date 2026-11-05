@@ -520,6 +520,11 @@ func renderIgnoredTag(c *ui.Context, t *ui.Theme) {
 // none to show, saying why.
 func renderPreviewNotice(c *ui.Context, t *ui.Theme, p git.FilePreview) {
 	title, detail := previewNotice(p)
+	renderNotice(c, t, title, detail)
+}
+
+// renderNotice says, where a file's contents would be, why they are not.
+func renderNotice(c *ui.Context, t *ui.Theme, title, detail string) {
 	ui.Column(c.Key("preview-notice")).Grow(1).FillWidth().Center().Padding(24).Gap(6).Children(func() {
 		ui.Icon(c, IconFile).Size(28, 28).TextColor(t.TextMuted.Alpha(0.6))
 		ui.Text(c, title).FontSize(13).FontWeight(500).Margin(6, 0, 0, 0)
