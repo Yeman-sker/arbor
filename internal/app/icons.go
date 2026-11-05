@@ -266,8 +266,16 @@ func iconAndColorForFile(path string, t *ui.Theme) (*ui.SVG, ui.Color) {
 	}
 }
 
+// fileIconRestAlpha is how much of a file's icon shows on a row at rest.
+const fileIconRestAlpha = 0.84
+
 // renderFileIcon renders a file's language icon with its Catppuccin color and hover/select spring pop.
 func renderFileIcon(c *ui.Context, path string, size float32, selected, hovered bool) {
+	renderFileIconAt(c, path, size, selected, hovered, fileIconRestAlpha)
+}
+
+// renderFileIconAt is renderFileIcon with how much of the icon shows at rest.
+func renderFileIconAt(c *ui.Context, path string, size float32, selected, hovered bool, restAlpha float32) {
 	t := c.Theme()
 	ic, col := iconAndColorForFile(path, t)
 	scale := float32(1.0)
@@ -281,7 +289,7 @@ func renderFileIcon(c *ui.Context, path string, size float32, selected, hovered 
 	} else if selected {
 		scale = 1.07
 	} else {
-		col = col.Alpha(0.84)
+		col = col.Alpha(restAlpha)
 	}
 	el := ui.Icon(c, ic).Size(size, size).Shrink(0)
 	el.TextColor(el.AnimateColor("ic", col, microColorAnim)).

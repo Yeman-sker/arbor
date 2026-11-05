@@ -4,6 +4,7 @@ import (
 	"arbor/internal/git"
 	"context"
 	"path"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -60,6 +61,11 @@ type repoWatch struct {
 	// ignored holds the directories (relative, slash separated) that Git
 	// ignores as a whole. Only read by the watch.
 	ignored atomic.Pointer[map[string]bool]
+
+	// dirs holds the watches of single directories, by their path in the tree,
+	// each with what ends it. They follow what the tree shows and the repository
+	// watch does not reach, for as long as it shows it. Owned by the UI thread.
+	dirs map[string]context.CancelFunc
 }
 
 func newRepoWatch(root string) *repoWatch {
@@ -126,6 +132,76 @@ func (a *app) ensureWatch() {
 	}
 	pub := a.publisher()
 	go a.runWatch(w, pub, start)
+	a.syncTree()
+}
+
+// syncDirWatches makes the single directories being watched those in want. Such
+// a watch is one directory, without what is below it, so that looking into
+// node_modules costs a few watches rather than a watch on all of it.
+func (a *app) syncDirWatches(want map[string]bool) {
+	w := a.live.w
+	if w == nil {
+		return
+	}
+	for dir, cancel := range w.dirs {
+		if !want[dir] {
+			cancel()
+			delete(w.dirs, dir)
+		}
+	}
+	if len(want) == 0 {
+		return
+	}
+	start := a.live.startWatch
+	if start == nil {
+		start = startFileWatch
+	}
+	pub := a.publisher()
+	for dir := range want {
+		if _, on := w.dirs[dir]; on {
+			continue
+		}
+		if w.dirs == nil {
+			w.dirs = make(map[string]context.CancelFunc)
+		}
+		ctx, cancel := context.WithCancel(w.ctx)
+		w.dirs[dir] = cancel
+		go a.runDirWatch(ctx, w, dir, pub, start)
+	}
+}
+
+// runDirWatch reports the changes to the directory dir until ctx ends. A watch
+// that ends by itself, as when the directory is deleted, is forgotten, so that
+// the directory is watched again if it comes back.
+func (a *app) runDirWatch(ctx context.Context, w *repoWatch, dir string, pub func(func()), start watchStarter) {
+	// The directory may be, or be in, a link: watch where it really is.
+	abs, err := filepath.EvalSymlinks(filepath.Join(w.root, filepath.FromSlash(dir)))
+	if err == nil {
+		var src hintSource
+		src, err = start(ctx, abs, mygo.FileWatchOptions{
+			HintsOnly: true,
+			Debounce:  watchDebounce,
+			MaxDelay:  watchMaxDelay,
+		})
+		if err == nil {
+			defer src.Close()
+			for {
+				if _, err := src.Next(ctx); err != nil {
+					break
+				}
+				pub(func() { a.dirChanged(dir) })
+			}
+		}
+	}
+	if ctx.Err() != nil {
+		return
+	}
+	pub(func() {
+		if cancel, on := w.dirs[dir]; on && ctx.Err() == nil {
+			cancel()
+			delete(w.dirs, dir)
+		}
+	})
 }
 
 // runWatch starts the watches of w and reads their changes until w ends. It

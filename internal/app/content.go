@@ -13,9 +13,10 @@ import (
 
 // loadedFile is what the Files view shows.
 type loadedFile struct {
-	ok         bool
-	path       string
-	text, head string
+	ok      bool
+	path    string
+	preview git.FilePreview
+	head    string
 }
 
 // loadedDiff is what the diff view shows; key says which diff it is.
@@ -42,17 +43,23 @@ type contentState struct {
 // already; the text arrives from the background.
 func (a *app) openExplorerFile(relPath string) {
 	root := a.repo.Root
+	listed := inTree(a.repo, relPath)
 	c := &a.live.content
 	c.fileSeq++
 	seq := c.fileSeq
 	a.goLoad(func() func() {
-		text := git.ReadWorktreeFile(root, relPath)
-		head := git.ReadFileAtRef(root, "HEAD", relPath)
+		preview := git.ReadFilePreview(root, relPath)
+		// Only text has lines to mark, and Git has no other version of a file
+		// it doesn't list.
+		head := ""
+		if listed && preview.Kind == git.PreviewText {
+			head = git.ReadFileAtRef(root, "HEAD", relPath)
+		}
 		return func() {
 			if c.fileSeq != seq || a.selectedFile != relPath {
 				return
 			}
-			a.showFile(relPath, text, head)
+			a.showFile(relPath, preview, head)
 			a.pending.file.publish(a, seq, perf.PhaseLoadFile, perf.ResultOK)
 		}
 	})
@@ -61,10 +68,10 @@ func (a *app) openExplorerFile(relPath string) {
 // showFile puts the text of a file in the Files view. When it is the file
 // already shown and nothing in it changed, the editor is not touched; when
 // its text changed, the scroll position is kept.
-func (a *app) showFile(rel, text, head string) {
+func (a *app) showFile(rel string, preview git.FilePreview, head string) {
 	f := &a.live.content.file
 	same := f.ok && f.path == rel
-	if same && f.text == text && f.head == head {
+	if same && f.preview == preview && f.head == head {
 		return
 	}
 	st := a.codeState
@@ -73,8 +80,8 @@ func (a *app) showFile(rel, text, head string) {
 		a.contentSeq++
 		st.Buffer.SetLanguage(editor.LanguageFor(rel))
 	}
-	if !same || f.text != text {
-		st.Buffer.Reset(text)
+	if !same || f.preview.Text != preview.Text {
+		st.Buffer.Reset(preview.Text)
 	}
 	if !same || f.head != head {
 		if head != "" {
@@ -86,12 +93,13 @@ func (a *app) showFile(rel, text, head string) {
 	if same {
 		st.SetScrollY(scrollY)
 	}
-	*f = loadedFile{ok: true, path: rel, text: text, head: head}
+	*f = loadedFile{ok: true, path: rel, preview: preview, head: head}
 }
 
 // clearExplorerFile closes the file of the Files view.
 func (a *app) clearExplorerFile() {
 	a.selectedFile = ""
+	a.fileOffGit = false
 	a.live.content.fileSeq++
 	if a.live.content.file.ok {
 		a.codeState.Buffer.Reset("")
@@ -104,9 +112,15 @@ func (a *app) clearExplorerFile() {
 // reselectExplorerFile reads the open file again after the repository
 // changed. When the file is gone (another branch has no such file, it was
 // deleted) another one is opened in its place, so that the view never shows
-// a file that is not there.
+// a file that is not there. Only Git's list is looked at, so a file it does not
+// list stays open: the view says when one is gone, and what a build generates
+// comes back.
 func (a *app) reselectExplorerFile(snap *git.RepoSnapshot) {
-	if inTree(snap, a.selectedFile) {
+	listed := inTree(snap, a.selectedFile)
+	if listed {
+		a.fileOffGit = false
+	}
+	if listed || a.fileOffGit || snap.IsIgnored(a.selectedFile) {
 		a.selectExplorerFile(a.selectedFile)
 		return
 	}

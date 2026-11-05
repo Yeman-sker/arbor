@@ -5,7 +5,9 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"path"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -85,11 +87,19 @@ type RepoSnapshot struct {
 	Staged      []FileStatus
 	Unstaged    []FileStatus
 	StatusByRel map[string]string // rel path -> badge ("M", "A", "D", "U")
-	TreeRoots   []string
-	TreeDirs    map[string][]string
-	AllFiles    []string
-	Commits     []Commit
-	Graph       []GraphRow
+	// Ignored holds what Git ignores, and for each path whether it is a
+	// directory. What is in an ignored directory is not listed, here or in the
+	// tree: node_modules alone can hold more files than the rest of the
+	// repository by orders of magnitude, so the view reads it when it opens.
+	Ignored   map[string]bool
+	TreeRoots []string
+	TreeDirs  map[string][]string
+	// AllFiles is the sorted list of the files Git tracks or could track,
+	// without the ignored ones: it is what a window opens a file from, and what
+	// the performance log sizes a repository by.
+	AllFiles []string
+	Commits  []Commit
+	Graph    []GraphRow
 }
 
 func findWorktreeDotGitRoot(dir string) string {
@@ -184,7 +194,7 @@ func LoadRepo(dir string) (*RepoSnapshot, error) {
 	wg.Add(5)
 	go func() {
 		defer wg.Done()
-		bOut, bErr = Run(root, "status", "--porcelain=v2", "--branch", "-uall")
+		bOut, bErr = Run(root, statusArgs...)
 	}()
 	go func() {
 		defer wg.Done()
@@ -240,6 +250,12 @@ func LoadRepo(dir string) (*RepoSnapshot, error) {
 	}
 	return snap, nil
 }
+
+// statusArgs is how the repository's status is read. With --ignored=matching
+// the same walk also names what Git ignores: an ignored directory as one line,
+// however much is in it, where -uall alone or --ignored=traditional would list
+// every file of node_modules.
+var statusArgs = []string{"status", "--porcelain=v2", "--branch", "-uall", "--ignored=matching"}
 
 // branchFormat is the for-each-ref format parseBranches reads: whether the
 // branch is checked out here (*), its name, the committer date of its tip and
@@ -350,6 +366,8 @@ func parseStatusV2(out string, snap *RepoSnapshot) {
 				Untrack: true,
 			})
 			snap.StatusByRel[path] = "U"
+		} else if rest, ok := strings.CutPrefix(line, "! "); ok {
+			addIgnoredPath(snap, rest)
 		}
 	}
 
@@ -375,54 +393,77 @@ func ignoredDir(name string) bool {
 	return false
 }
 
+// addTreePath records p as a child of its directory, and those directories as
+// children of theirs. seen maps a directory to what is in it.
+func addTreePath(seen map[string]map[string]bool, p string, isDir bool) {
+	if isDir && seen[p] == nil {
+		seen[p] = make(map[string]bool)
+	}
+	for cur := p; ; {
+		parent := parentDir(cur)
+		m := seen[parent]
+		if m == nil {
+			m = make(map[string]bool)
+			seen[parent] = m
+		}
+		m[cur] = true
+		if parent == "" {
+			return
+		}
+		cur = parent
+	}
+}
+
+// buildWorkspaceTreeFromList builds the tree from the output of ls-files and
+// what parseStatusV2 found to be ignored.
 func buildWorkspaceTreeFromList(nulOut string, snap *RepoSnapshot) {
 	seenDirs := make(map[string]map[string]bool)
 	var allFiles []string
-	for _, p := range strings.Split(nulOut, "\x00") {
-		p = strings.TrimSuffix(filepath.ToSlash(p), "/")
-		if p == "" {
+	for _, raw := range strings.Split(nulOut, "\x00") {
+		raw = filepath.ToSlash(raw)
+		// A path ending in a slash is a repository inside this one, which Git
+		// does not look into: a directory, not a file to open.
+		p, isDir := strings.CutSuffix(raw, "/")
+		if p == "" || hiddenEntry(path.Base(p)) {
 			continue
 		}
-		allFiles = append(allFiles, p)
-		cur := p
-		for {
-			parent := filepath.ToSlash(filepath.Dir(cur))
-			if parent == "." || parent == "/" || parent == "" {
-				parent = ""
-			}
-			m := seenDirs[parent]
-			if m == nil {
-				m = make(map[string]bool)
-				seenDirs[parent] = m
-			}
-			m[cur] = true
-			if parent == "" {
-				break
-			}
-			cur = parent
+		if !isDir {
+			allFiles = append(allFiles, p)
 		}
+		addTreePath(seenDirs, p, isDir)
 	}
 	sort.Strings(allFiles)
-	dedup := allFiles[:0]
-	for i, f := range allFiles {
-		if i == 0 || f != allFiles[i-1] {
-			dedup = append(dedup, f)
+	snap.AllFiles = slices.Compact(allFiles)
+
+	// A directory that holds nothing but ignored files is as good as ignored
+	// itself, though no pattern names it: *.log and a logs/ of nothing else.
+	var impliedDirs []string
+	for p := range snap.Ignored {
+		for d := parentDir(p); d != ""; d = parentDir(d) {
+			if _, listed := seenDirs[d]; listed {
+				break
+			}
+			impliedDirs = append(impliedDirs, d)
 		}
 	}
-	snap.AllFiles = dedup
+	for p, isDir := range snap.Ignored {
+		addTreePath(seenDirs, p, isDir)
+	}
+	for _, d := range impliedDirs {
+		snap.Ignored[d] = true
+	}
 
 	for dir, childrenMap := range seenDirs {
-		var dirs, files []string
+		entries := make([]DirEntry, 0, len(childrenMap))
 		for child := range childrenMap {
-			if _, isDir := seenDirs[child]; isDir {
-				dirs = append(dirs, child)
-			} else {
-				files = append(files, child)
-			}
+			_, isDir := seenDirs[child]
+			entries = append(entries, DirEntry{Path: child, IsDir: isDir})
 		}
-		sort.Strings(dirs)
-		sort.Strings(files)
-		combined := append(dirs, files...)
+		sortDirEntries(entries)
+		combined := make([]string, len(entries))
+		for i, e := range entries {
+			combined[i] = e.Path
+		}
 		if dir == "" {
 			snap.TreeRoots = combined
 		} else {
@@ -472,8 +513,8 @@ func buildWorkspaceTreeFallback(root string, snap *RepoSnapshot) {
 				snap.AllFiles = append(snap.AllFiles, childRel)
 			}
 		}
-		sort.Strings(dirs)
-		sort.Strings(files)
+		slices.SortFunc(dirs, compareNatural)
+		slices.SortFunc(files, compareNatural)
 		return append(dirs, files...)
 	}
 	snap.TreeRoots = walk("")
@@ -483,11 +524,7 @@ func buildWorkspaceTreeFallback(root string, snap *RepoSnapshot) {
 const maxPreviewBytes = 512 * 1024
 
 func sanitizePreviewText(data []byte) string {
-	probe := data
-	if len(probe) > 8192 {
-		probe = probe[:8192]
-	}
-	if bytes.IndexByte(probe, 0) != -1 {
+	if looksBinary(data) {
 		return "// Binary file not shown"
 	}
 	if len(data) > maxPreviewBytes {

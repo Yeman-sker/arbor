@@ -71,8 +71,13 @@ type app struct {
 	explorerQuery string
 	onlyChanged   bool
 	selectedFile  string
-	codeState     *editor.State
-	codeSoftWrap  bool
+	// fileOffGit says Git does not list the file open: it is ignored, or in a
+	// submodule or a link to a directory. Git cannot say that such a file went
+	// away, and one that a build generates may well come back.
+	fileOffGit   bool
+	tree         fileTree
+	codeState    *editor.State
+	codeSoftWrap bool
 
 	// Mode 1: Git (Source Control + Graph) state
 	gitChangesH     float32
@@ -226,15 +231,17 @@ func (a *app) applyRepoSnapshot(snap *git.RepoSnapshot, err error) {
 	a.repoDir = snap.Root
 	a.repoErr = ""
 
-	// Expand first top-level directory by default on initial load
+	// Expand first top-level directory by default on initial load: one of the
+	// project's own, not whatever happens to sort first, such as node_modules.
 	if len(a.openDirs) == 0 {
 		for _, r := range snap.TreeRoots {
-			if _, isDir := snap.TreeDirs[r]; isDir {
+			if _, isDir := snap.TreeDirs[r]; isDir && !isListedIgnored(snap, r) {
 				a.openDirs[r] = true
 				break
 			}
 		}
 	}
+	a.treeRepoChanged()
 
 	// Ensure a file is open in Files mode
 	if a.selectedFile == "" && len(snap.AllFiles) > 0 {
@@ -299,8 +306,14 @@ func (a *app) selectExplorerFile(relPath string) {
 	if _, isDir := a.repo.TreeDirs[relPath]; isDir {
 		return
 	}
+	if relPath != a.selectedFile {
+		a.fileOffGit = !inTree(a.repo, relPath)
+	}
 	a.selectedFile = relPath
 	a.openExplorerFile(relPath) // content.go: reads the file in the background
+	if a.live.w != nil {
+		a.syncTree() // the file may be in a directory only it needs watched
+	}
 }
 
 func (a *app) selectWorkingFile(st git.FileStatus) {
@@ -425,7 +438,9 @@ func (a *app) view(c *ui.Context) {
 	}
 	if c.Shortcut(ui.Cmd, ui.KeyF) {
 		if a.activeMode == modeFiles {
-			a.codeState.Run(editor.Find)
+			if _, notice := a.openFileNotice(); !notice {
+				a.codeState.Run(editor.Find)
+			}
 		} else {
 			a.diffState.Run(editor.Find)
 		}
@@ -538,57 +553,13 @@ func (a *app) sidebarView(c *ui.Context, t *ui.Theme) {
 	})
 }
 
-type flatTreeNode struct {
-	path  string
-	name  string
-	depth int
-	isDir bool
-	open  bool
-	badge string
-}
-
-func (a *app) buildFlatTree(query string) []flatTreeNode {
-	var out []flatTreeNode
-	if query != "" || a.onlyChanged {
-		for _, f := range a.repo.AllFiles {
-			badge := a.repo.StatusByRel[f]
-			if a.onlyChanged && badge == "" {
-				continue
-			}
-			if query != "" && !strings.Contains(strings.ToLower(f), query) {
-				continue
-			}
-			out = append(out, flatTreeNode{
-				path:  f,
-				name:  f,
-				depth: 0,
-				isDir: false,
-				badge: badge,
-			})
-		}
-		return out
+// treeLabelColor is the color of an ignored row's name: muted, until the row is
+// the one being looked at.
+func treeLabelColor(t *ui.Theme, selected, hovered bool) ui.Color {
+	if selected || hovered {
+		return t.Text
 	}
-
-	var walk func(items []string, depth int)
-	walk = func(items []string, depth int) {
-		for _, p := range items {
-			kids, isDir := a.repo.TreeDirs[p]
-			open := isDir && a.openDirs[p]
-			out = append(out, flatTreeNode{
-				path:  p,
-				name:  filepath.Base(p),
-				depth: depth,
-				isDir: isDir,
-				open:  open,
-				badge: a.repo.StatusByRel[p],
-			})
-			if isDir && open {
-				walk(kids, depth+1)
-			}
-		}
-	}
-	walk(a.repo.TreeRoots, 0)
-	return out
+	return t.TextMuted
 }
 
 func (a *app) filesSidebarBody(c *ui.Context, t *ui.Theme) {
@@ -603,11 +574,17 @@ func (a *app) filesSidebarBody(c *ui.Context, t *ui.Theme) {
 
 	a.trackSearch()
 	q := strings.ToLower(strings.TrimSpace(a.explorerQuery))
-	nodes := a.buildFlatTree(q)
+	a.syncIgnoredSearch(q)
+	nodes := a.treeNodes(q)
+	filtered := q != "" || a.onlyChanged
 
 	a.explorerList.Key = func(i int) any { return nodes[i].path }
 	a.fades.tree.List(c, t, a.contentSeq, &a.explorerList, len(nodes), func(i int) {
 		n := nodes[i]
+		if n.kind != nodeEntry {
+			renderTreeNote(c, t, n)
+			return
+		}
 		selected := !n.isDir && n.path == a.selectedFile
 		row := ui.Row(c.Key("tree:"+n.path)).Height(24).
 			Padding(0, 8, 0, float32(6+n.depth*14)).Gap(6).Radius(5).
@@ -652,8 +629,11 @@ func (a *app) filesSidebarBody(c *ui.Context, t *ui.Theme) {
 
 		if row.Clicked() {
 			if n.isDir {
-				a.openDirs[n.path] = !a.openDirs[n.path]
+				a.toggleDir(n.path)
 			} else {
+				if filtered {
+					a.revealInTree(n.path)
+				}
 				a.openFile(n.path)
 			}
 		}
@@ -667,7 +647,12 @@ func (a *app) filesSidebarBody(c *ui.Context, t *ui.Theme) {
 
 		row.Children(func() {
 			if n.isDir {
-				chev := ui.Icon(c, IconChevronRight).Size(12, 12).TextColor(t.TextMuted)
+				dim := n.ignored && !hovered
+				chevCol := t.TextMuted
+				if dim {
+					chevCol = chevCol.Alpha(ignoredIconAlpha)
+				}
+				chev := ui.Icon(c, IconChevronRight).Size(12, 12).TextColor(chevCol)
 				rotTarget := float32(0)
 				if n.open {
 					rotTarget = 90
@@ -678,7 +663,12 @@ func (a *app) filesSidebarBody(c *ui.Context, t *ui.Theme) {
 				folderScale := float32(1.0)
 				if n.open {
 					folderIc = IconFolderOpen
-					folderCol = t.Accent.Alpha(0.85)
+					if !n.ignored {
+						folderCol = t.Accent.Alpha(0.85)
+					}
+				}
+				if dim {
+					folderCol = folderCol.Alpha(ignoredIconAlpha)
 				}
 				if hovered {
 					folderScale = 1.1
@@ -690,6 +680,9 @@ func (a *app) filesSidebarBody(c *ui.Context, t *ui.Theme) {
 
 				lbl := ui.Text(c, n.name).FontSize(12.5).SingleLine().Grow(1)
 				lbl.Translate(lbl.Spring("x", nudgeX, microSpring), 0)
+				if n.ignored {
+					lbl.TextColor(lbl.AnimateColor("fg", treeLabelColor(t, selected, hovered), microColorAnim))
+				}
 				if n.badge != "" {
 					dot := ui.Box(c).Size(5.5, 5.5).Radius(3).Background(t.Warning)
 					dotScale := float32(1.0)
@@ -700,11 +693,26 @@ func (a *app) filesSidebarBody(c *ui.Context, t *ui.Theme) {
 				}
 			} else {
 				ui.Box(c).Width(12) // align with folder chevron
-				renderFileIcon(c, n.path, 14, selected, hovered)
-				lbl := ui.Text(c, n.name).FontSize(12.5).SingleLine().Grow(1)
+				iconAlpha := float32(fileIconRestAlpha)
+				if n.ignored {
+					iconAlpha = ignoredIconAlpha
+				}
+				renderFileIconAt(c, n.path, 14, selected, hovered, iconAlpha)
+				lbl := ui.Text(c, n.name).FontSize(12.5).SingleLine()
 				lbl.Translate(lbl.Spring("x", nudgeX, microSpring), 0)
+				if n.ignored {
+					lbl.TextColor(lbl.AnimateColor("fg", treeLabelColor(t, selected, hovered), microColorAnim))
+				}
 				if selected {
 					lbl.FontWeight(500)
+				}
+				// A search result says where it is. The name comes first: paths
+				// in node_modules run on long after a sidebar has ended.
+				if n.dir != "" {
+					lbl.Shrink(0)
+					ui.Text(c, n.dir).FontSize(11).TextColor(t.TextMuted).SingleLine().Grow(1).Shrink(1).MinWidth(0).Clip()
+				} else {
+					lbl.Grow(1)
 				}
 				renderStatusBadge(c, n.badge, selected || hovered)
 			}
@@ -1209,6 +1217,9 @@ func (a *app) filesMainPane(c *ui.Context, t *ui.Theme) {
 
 		badge := a.repo.StatusByRel[a.selectedFile]
 		renderStatusBadge(c, badge, true)
+		if a.repo.IsIgnored(a.selectedFile) {
+			renderIgnoredTag(c, t)
+		}
 
 		ui.Spacer(c)
 
@@ -1233,6 +1244,9 @@ func (a *app) filesMainPane(c *ui.Context, t *ui.Theme) {
 			}
 		}
 
+		if _, notice := a.openFileNotice(); notice {
+			return // no text to wrap or to look through
+		}
 		if iconBtn(c, "code-wrap", IconWrapText, "Toggle Soft Wrap", a.codeSoftWrap) {
 			a.codeSoftWrap = !a.codeSoftWrap
 		}
@@ -1257,8 +1271,22 @@ func (a *app) filesMainPane(c *ui.Context, t *ui.Theme) {
 	}, ui.KeyframeOptions{Run: a.contentSeq})
 	edWrap.Opacity(0.75+0.25*k).Translate(0, (1-k)*3)
 	edWrap.Children(func() {
+		if p, notice := a.openFileNotice(); notice {
+			renderPreviewNotice(c, t, p)
+			return
+		}
 		a.fades.code.Editor(c, t, a.contentSeq, a.codeState).Grow(1).FillWidth()
 	})
+}
+
+// openFileNotice returns what opening the file on screen found, and whether that
+// is something to say rather than text to show.
+func (a *app) openFileNotice() (git.FilePreview, bool) {
+	f := &a.live.content.file
+	if !f.ok || f.path != a.selectedFile || f.preview.Kind == git.PreviewText {
+		return git.FilePreview{}, false
+	}
+	return f.preview, true
 }
 
 func (a *app) gitMainPane(c *ui.Context, t *ui.Theme) {
@@ -1514,6 +1542,7 @@ func (a *app) resetRepoView() {
 	a.clearExplorerFile()
 	a.explorerQuery = ""
 	a.openDirs = make(map[string]bool)
+	a.tree = fileTree{}
 	a.expandedCommit, a.selectedCommit, a.commitFiles, a.selectedCommitF = "", nil, nil, -1
 	a.diffKind, a.diffTitle, a.diffBadge, a.diffFileStat = diffNone, "", "", nil
 	c := &a.live.content

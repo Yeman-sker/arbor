@@ -108,6 +108,7 @@ func (a *app) endSession() {
 		a.live.q = nil
 	}
 	a.stopWatch()
+	a.tree.cancelWork()
 	a.live.writes = 0
 	a.live.spins = nil
 	a.busyText = ""
