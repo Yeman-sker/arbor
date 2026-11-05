@@ -445,6 +445,12 @@ func primaryActionBtn(c *ui.Context, key string, ic *ui.SVG, label string, disab
 
 // compactInput renders a sleek 28px single-line input box with a blooming focus ring and icon pop.
 func compactInput(c *ui.Context, key string, ic *ui.SVG, value *string, placeholder string) (submitted bool) {
+	return compactInputWith(c, key, ic, value, placeholder, nil)
+}
+
+// compactInputWith is compactInput with setup, when set, called on the input
+// itself: for what a caller needs of it beyond its text, such as its keys.
+func compactInputWith(c *ui.Context, key string, ic *ui.SVG, value *string, placeholder string, setup func(ui.Element)) (submitted bool) {
 	t := c.Theme()
 	box := ui.Row(c.Key(key+"-box")).Height(28).Padding(0, 8).Gap(6).Radius(5).
 		AlignItems(ui.Center).Grow(1).Shrink(1).MinWidth(0).Clip()
@@ -488,6 +494,9 @@ func compactInput(c *ui.Context, key string, ic *ui.SVG, value *string, placehol
 		}
 		in := ui.TextInputBase(c.Key(key), value).Placeholder(placeholder).Label(placeholder).
 			FontSize(12).Grow(1).Shrink(1).MinWidth(0)
+		if setup != nil {
+			setup(in)
+		}
 		submitted = in.Submitted()
 	})
 	return submitted
