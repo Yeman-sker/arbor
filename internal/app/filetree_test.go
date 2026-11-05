@@ -493,7 +493,7 @@ func TestOpeningASearchResultRevealsItInTheTree(t *testing.T) {
 func TestAFileWithNoTextToShowSaysWhy(t *testing.T) {
 	dir := newTestRepo(t, map[string]string{"a.txt": "a\n"})
 	writeFile(t, dir, "empty.txt", "")
-	if err := os.WriteFile(filepath.Join(dir, "logo.png"), append([]byte("\x89PNG\r\n\x1a\n\x00"), make([]byte, 2000)...), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, "logo.bin"), append([]byte("\x89PNG\r\n\x1a\n\x00"), make([]byte, 2000)...), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(filepath.Join(dir, "locked.txt"), []byte("x"), 0o000); err != nil {
@@ -504,7 +504,7 @@ func TestAFileWithNoTextToShowSaysWhy(t *testing.T) {
 
 	for _, c := range []struct{ file, title, detail string }{
 		{"empty.txt", "This file is empty", ""},
-		{"logo.png", "Binary file", "2.0 KB. It can't be shown as text."},
+		{"logo.bin", "Binary file", "2.0 KB. It can't be shown as text."},
 	} {
 		a.openFile(c.file)
 		h.settle()
@@ -534,7 +534,7 @@ func TestAFileWithNoTextToShowSaysWhy(t *testing.T) {
 	}
 	// ⌘F has nothing to look through in a file without text, and must not open a
 	// find bar for the next one.
-	a.openFile("logo.png")
+	a.openFile("logo.bin")
 	h.settle()
 	h.tt.Key(ui.Cmd, ui.KeyF)
 	h.settle()

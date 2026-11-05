@@ -33,6 +33,7 @@ var (
 	IconUndo         = mustLucide(`<path d="M3 7v6h6"/><path d="M21 17a9 9 0 0 0-9-9 9 9 0 0 0-6 2.3L3 13"/>`)
 	IconCheck        = mustLucide(`<path d="M20 6 9 17l-5-5"/>`)
 	IconSearch       = mustLucide(`<circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/>`)
+	IconCode         = mustLucide(`<path d="m16 18 6-6-6-6"/><path d="m8 6-6 6 6 6"/>`)
 	IconFilter       = mustLucide(`<polygon points="22 3 2 3 10 12.46 10 19 14 21 14 12.46 22 3"/>`)
 	IconColumns      = mustLucide(`<rect width="18" height="18" x="3" y="3" rx="2"/><path d="M12 3v18"/>`)
 	IconRows         = mustLucide(`<rect width="18" height="18" x="3" y="3" rx="2"/><path d="M3 12h18"/>`)
