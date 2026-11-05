@@ -39,6 +39,10 @@ type contentState struct {
 	// newestFile is fileSeq for the loads to read in the background, as one that
 	// waits for its turn to decode an image can see that it is no longer wanted.
 	newestFile atomic.Uint64
+	// place is the part of the file on screen to read, the start of a file for
+	// one just opened, and partMove where to go in it once it has loaded.
+	place    git.PreviewPlace
+	partMove partMove
 
 	file loadedFile
 	diff loadedDiff
@@ -56,8 +60,9 @@ func (a *app) openExplorerFile(relPath string) {
 	if c.file.ok && c.file.path == relPath {
 		known = c.file.image
 	}
+	place := c.place
 	a.goLoad(func() func() {
-		preview := git.ReadFilePreview(root, relPath)
+		preview := git.ReadFilePreviewAt(root, relPath, place)
 		var image *fileImage
 		if isImagePath(relPath) && (preview.Kind == git.PreviewText || preview.Kind == git.PreviewBinary) {
 			var current bool
@@ -66,10 +71,11 @@ func (a *app) openExplorerFile(relPath string) {
 			}
 		}
 		// Only text has lines to mark, and Git has no other version of a file
-		// it doesn't list.
+		// it doesn't list. A part of a file has nothing to compare with the whole
+		// of it, and asking Git for all of it could be gigabytes.
 		head := ""
-		if listed && preview.Kind == git.PreviewText {
-			head = git.ReadFileAtRef(root, "HEAD", relPath)
+		if listed && preview.Kind == git.PreviewText && !preview.Partial() && changeMarksAffordable(root, relPath, preview.Size) {
+			head = git.ReadTextAtRef(root, "HEAD", relPath)
 		}
 		return func() {
 			if c.fileSeq != seq || a.selectedFile != relPath {
@@ -92,7 +98,15 @@ func (c *contentState) nextFile() uint64 {
 // already shown and nothing in it changed, the editor is not touched; when
 // its text changed, the scroll position is kept.
 func (a *app) showFile(rel string, preview git.FilePreview, head string, image *fileImage) {
-	f := &a.live.content.file
+	content := &a.live.content
+	move := content.partMove
+	content.partMove = partStay
+	// From here on it reads these lines again: a file growing at the end, or the
+	// end of it being asked for, is no reason for them to move.
+	if preview.Kind == git.PreviewText {
+		content.place = git.PreviewPlace{Offset: preview.Start}
+	}
+	f := &content.file
 	same := f.ok && f.path == rel
 	if same && f.preview == preview && f.head == head && f.image == image {
 		return
@@ -113,7 +127,14 @@ func (a *app) showFile(rel string, preview git.FilePreview, head string, image *
 			st.DiffBase = nil
 		}
 	}
-	if same {
+	switch {
+	case move == partTop:
+		st.Run(editor.MoveDocStart)
+		a.contentSeq++
+	case move == partBottom:
+		st.Run(editor.MoveDocEnd)
+		a.contentSeq++
+	case same:
 		st.SetScrollY(scrollY)
 	}
 	*f = loadedFile{ok: true, path: rel, preview: preview, head: head, image: image}
