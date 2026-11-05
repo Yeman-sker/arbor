@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -445,6 +446,19 @@ func TestReportCommand(t *testing.T) {
 	}
 }
 
+// lockedBuffer stands in for os.Stderr, which a command writes its two outputs to
+// from two goroutines at once.
+type lockedBuffer struct {
+	mu sync.Mutex
+	b  bytes.Buffer
+}
+
+func (w *lockedBuffer) Write(p []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.b.Write(p)
+}
+
 // The rest of the tests give compare and record their results through -input, so
 // this is the one that runs the command itself, against this checkout: it has to
 // reach the benchmarks, wherever they live.
@@ -453,10 +467,10 @@ func TestRunBenchmarksReachesTheBenchmarksOfThisCheckout(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	var progress bytes.Buffer
+	var progress lockedBuffer
 	raw, err := runBenchmarks(root, "^BenchmarkComputeGraph$/^small$", "1x", 1, &progress)
 	if err != nil {
-		t.Fatalf("%v\n%s", err, progress.String())
+		t.Fatalf("%v\n%s", err, progress.b.String())
 	}
 	out, err := ParseBench(bytes.NewReader(raw))
 	if err != nil {
