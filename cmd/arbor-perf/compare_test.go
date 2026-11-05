@@ -444,3 +444,25 @@ func TestReportCommand(t *testing.T) {
 		t.Fatalf("missing input: code %d", code)
 	}
 }
+
+// The rest of the tests give compare and record their results through -input, so
+// this is the one that runs the command itself, against this checkout: it has to
+// reach the benchmarks, wherever they live.
+func TestRunBenchmarksReachesTheBenchmarksOfThisCheckout(t *testing.T) {
+	root, err := findRoot(".")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var progress bytes.Buffer
+	raw, err := runBenchmarks(root, "^BenchmarkComputeGraph$/^small$", "1x", 1, &progress)
+	if err != nil {
+		t.Fatalf("%v\n%s", err, progress.String())
+	}
+	out, err := ParseBench(bytes.NewReader(raw))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := out.Benchmarks["ComputeGraph/small"]; !ok {
+		t.Fatalf("no ComputeGraph/small in what it printed:\n%s", raw)
+	}
+}
