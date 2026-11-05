@@ -30,14 +30,13 @@ import (
 	"time"
 )
 
-// runBenchmarks runs the benchmarks and returns what go test printed; tests
-// replace it.
-var runBenchmarks = func(root, bench, benchtime string, count int, progress io.Writer) ([]byte, error) {
+// runBenchmarks runs the benchmarks and returns what go test printed.
+func runBenchmarks(root, bench, benchtime string, count int, progress io.Writer) ([]byte, error) {
 	args := []string{"test", "-run", "^$", "-bench", bench, "-benchmem", "-count", strconv.Itoa(count), "-timeout", "60m"}
 	if benchtime != "" {
 		args = append(args, "-benchtime", benchtime)
 	}
-	args = append(args, ".")
+	args = append(args, benchPackage(root))
 	cmd := exec.Command("go", args...)
 	cmd.Dir = root
 	cmd.Env = append(os.Environ(), "CGO_ENABLED=0")
