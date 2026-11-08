@@ -1,7 +1,7 @@
 {
   "name": "Arbor",
   "identifier": "io.github.yemansker.arbor",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "main": "./cmd/arbor",
   "out": "build",
   "updates": {
