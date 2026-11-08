@@ -48,6 +48,7 @@ var scenarios = []Scenario{
 	{"switch_branch", "choose another branch from the branch picker", scenarioSwitchBranch},
 	{"stage_commit", "stage a file, then commit", scenarioStageCommit},
 	{"scroll_frames", "scroll the commit graph, counting dropped frames", scenarioScroll},
+	{"scroll_long_lines", "scroll long JSON lines in the Files view and the diff, counting dropped frames", scenarioScrollLongLines},
 	{"external_change", "change a file behind the app's back", scenarioExternalChange},
 	{"idle", "a settled window: frames drawn and CPU used", scenarioIdle},
 	{"memory", "resident memory after startup and after use (a baseline, no budget)", scenarioMemory},

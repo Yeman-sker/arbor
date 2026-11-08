@@ -360,7 +360,7 @@ func (a *app) selectCommitFile(fIdx int) {
 }
 
 func (a *app) setDiffBuffers(path, oldText, newText string) {
-	lang := editor.LanguageFor(path)
+	lang := languageFor(path)
 	a.diffState.Old.SetLanguage(lang)
 	a.diffState.New.SetLanguage(lang)
 	a.diffState.Old.Reset(oldText)
