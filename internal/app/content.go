@@ -115,7 +115,7 @@ func (a *app) showFile(rel string, preview git.FilePreview, head string, image *
 	scrollY := st.ScrollY()
 	if !same {
 		a.contentSeq++
-		st.Buffer.SetLanguage(editor.LanguageFor(rel))
+		st.Buffer.SetLanguage(languageFor(rel))
 	}
 	if !same || f.preview.Text != preview.Text {
 		st.Buffer.Reset(preview.Text)
@@ -267,7 +267,7 @@ func (a *app) showDiff(key, path, oldText, newText string) {
 	}
 	if !same {
 		a.contentSeq++
-		lang := editor.LanguageFor(path)
+		lang := languageFor(path)
 		a.diffState.Old.SetLanguage(lang)
 		a.diffState.New.SetLanguage(lang)
 	}
